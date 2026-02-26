@@ -1,29 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Filament-Management uninstaller
+APP_DIR="/opt/filament-management"
+SERVICE_NAME="filament-management"
 
-if [[ "${EUID}" -eq 0 ]]; then
-  echo "Bitte nicht als root starten. Nutze deinen normalen User; sudo wird bei Bedarf abgefragt." >&2
+if [ "${EUID}" -ne 0 ]; then
+  echo "Bitte mit sudo starten: sudo ./scripts/uninstall.sh"
   exit 1
 fi
 
-DEFAULT_INSTALL_DIR="/opt/filament-management"
-SERVICE_NAME="filament-management"
+systemctl stop "$SERVICE_NAME" || true
+systemctl disable "$SERVICE_NAME" || true
+rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
+systemctl daemon-reload
+rm -rf "$APP_DIR"
 
-read -r -p "Installationspfad löschen? [${DEFAULT_INSTALL_DIR}] (leer = nein): " INSTALL_DIR
-INSTALL_DIR="${INSTALL_DIR:-}"
-
-echo "==> Stoppe/Deaktiviere Service…"
-sudo systemctl disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
-sudo rm -f "/etc/systemd/system/${SERVICE_NAME}.service" || true
-sudo systemctl daemon-reload
-
-if [[ -n "${INSTALL_DIR}" ]]; then
-  echo "==> Lösche ${INSTALL_DIR}…"
-  sudo rm -rf "${INSTALL_DIR}"
-else
-  echo "==> Installationsordner wurde NICHT gelöscht."
-fi
-
-echo "Fertig ✅"
+echo "Uninstalled."
