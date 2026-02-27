@@ -24,26 +24,6 @@ Das wirkt sofort professionell.
 
 ---
 
-# 📣 2️⃣ Wo posten?
-
-Je nach Zielgruppe:
-
-## 🖨️ 3D Druck Community (beste Reichweite)
-
-### 🔥 Reddit
-- r/3Dprinting
-- r/klippers
-- r/Creality
-- r/FDMprinting
-
-Titelidee:
-> Open-Source Filament Manager for Creality CFS + Moonraker (One-Line Install)
-
----
-
-
----
-
 
 
 © bei jkef 2026
