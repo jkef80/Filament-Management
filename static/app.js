@@ -74,7 +74,7 @@ function slotEl(slotId, label, meta, isActive) {
   right.className = "slotRight";
   const tag = document.createElement("div");
   tag.className = "tag" + (!meta.material ? " muted" : "");
-  tag.textContent = meta.present === false ? "leer" : (isActive ? "aktiv" : "bereit");
+  tag.textContent = meta.present === false ? t('status.empty') : (isActive ? t('status.active') : t('status.ready'));
   right.appendChild(tag);
 
   wrap.appendChild(left);
@@ -179,6 +179,9 @@ async function postJson(url, payload) {
   return r.json();
 }
 
+// --- Spoolman integration ---
+let spoolmanConfigured = false;
+
 // --- Spool editor modal (local only) ---
 let spoolModalOpen = false;
 let spoolPrevPaused = null;
@@ -227,15 +230,96 @@ function openSpoolModal(slotId, meta) {
     const usedG = meta.spool_used_g;
     const totalG = meta.spool_consumed_g;
     if (remG != null && usedG != null) {
-      st.textContent = `Rest (berechnet): ${fmtG(remG)} · verbraucht seit Übernahme: ${fmtG(usedG)} · Gesamt (Slot): ${fmtG(totalG != null ? totalG : 0)}`;
+      st.textContent = t('spool.stats_full', {remaining: fmtG(remG), used: fmtG(usedG), total: fmtG(totalG != null ? totalG : 0)});
     } else if (remG != null) {
-      st.textContent = `Rest (aktuell): ${fmtG(remG)} · Tipp: "Istgewicht" eintragen und Übernehmen.`;
+      st.textContent = t('spool.stats_partial', {remaining: fmtG(remG)});
     } else {
-      st.textContent = 'Noch kein Referenzwert. Trage "Istgewicht" ein und klicke Übernehmen.';
+      st.textContent = t('spool.stats_none');
+    }
+  }
+
+  // --- Spoolman section ---
+  const smSec = $('spoolmanSection');
+  if (smSec) {
+    if (spoolmanConfigured) {
+      smSec.style.display = '';
+      const badge = $('spoolmanBadge');
+      const notLinked = $('spoolmanNotLinked');
+      const linked = $('spoolmanLinked');
+      const info = $('spoolmanInfo');
+      const smId = meta.spoolman_id;
+      if (smId) {
+        if (badge) { badge.textContent = t('spoolman.linked'); badge.classList.remove('muted'); badge.classList.add('ok'); }
+        if (notLinked) notLinked.style.display = 'none';
+        if (linked) linked.style.display = 'flex';
+        if (info) info.textContent = t('spoolman.linked_info', {
+          id: String(smId),
+          vendor: meta.manufacturer || meta.vendor || '',
+          name: meta.name || '',
+          remaining: fmtG(meta.spool_remaining_g != null ? meta.spool_remaining_g : meta.remaining_g),
+        });
+      } else {
+        if (badge) { badge.textContent = t('spoolman.not_linked'); badge.classList.add('muted'); badge.classList.remove('ok'); }
+        if (notLinked) notLinked.style.display = 'flex';
+        if (linked) linked.style.display = 'none';
+        loadSpoolmanDropdown(slotId);
+      }
+    } else {
+      smSec.style.display = 'none';
     }
   }
 
   m.style.display = 'block';
+}
+
+async function loadSpoolmanDropdown(slotId) {
+  const sel = $('spoolmanSelect');
+  if (!sel) return;
+  sel.innerHTML = '';
+  const ph = document.createElement('option');
+  ph.value = '';
+  ph.textContent = t('spoolman.loading');
+  sel.appendChild(ph);
+
+  try {
+    const r = await fetch(`/api/ui/spoolman/spools?slot=${encodeURIComponent(slotId)}`, { cache: 'no-store' });
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    const spools = data.spools || [];
+    sel.innerHTML = '';
+
+    if (!spools.length) {
+      const o = document.createElement('option');
+      o.value = '';
+      o.textContent = t('spoolman.no_spools');
+      sel.appendChild(o);
+      return;
+    }
+
+    const def = document.createElement('option');
+    def.value = '';
+    def.textContent = t('spoolman.select_ph');
+    sel.appendChild(def);
+
+    for (const sp of spools) {
+      const o = document.createElement('option');
+      o.value = String(sp.id);
+      o.textContent = t('spoolman.option_label', {
+        id: String(sp.id),
+        vendor: sp.vendor || '',
+        name: sp.filament_name || '',
+        material: sp.material || '',
+        remaining: sp.remaining_weight != null ? fmtG(sp.remaining_weight) : '?',
+      });
+      sel.appendChild(o);
+    }
+  } catch (e) {
+    sel.innerHTML = '';
+    const o = document.createElement('option');
+    o.value = '';
+    o.textContent = t('spoolman.error', { msg: e.message || String(e) });
+    sel.appendChild(o);
+  }
 }
 
 function initSpoolModal() {
@@ -293,6 +377,60 @@ function initSpoolModal() {
       await tick();
     };
   }
+
+  // --- Spoolman button handlers ---
+  const smLink = $('spoolmanLink');
+  const smUnlink = $('spoolmanUnlink');
+  const smRefresh = $('spoolmanRefresh');
+
+  if (smLink) {
+    smLink.onclick = async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (!spoolSlotId) return;
+      const sel = $('spoolmanSelect');
+      const id = sel ? Number(sel.value) : 0;
+      if (!id) return;
+      await postJson('/api/ui/spoolman/link', { slot: spoolSlotId, spoolman_id: id });
+      closeSpoolModal();
+      await tick();
+    };
+  }
+
+  if (smUnlink) {
+    smUnlink.onclick = async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (!spoolSlotId) return;
+      await postJson('/api/ui/spoolman/unlink', { slot: spoolSlotId });
+      closeSpoolModal();
+      await tick();
+    };
+  }
+
+  if (smRefresh) {
+    smRefresh.onclick = async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (!spoolSlotId) return;
+      // Re-link to re-import remaining_weight from Spoolman
+      const info = $('spoolmanInfo');
+      // Get spoolman_id from current state
+      try {
+        const r = await fetch('/api/ui/state', { cache: 'no-store' });
+        const j = await r.json();
+        const st = j.result || j;
+        const slotData = (st.slots || {})[spoolSlotId] || {};
+        const smId = slotData.spoolman_id;
+        if (!smId) return;
+        await postJson('/api/ui/spoolman/link', { slot: spoolSlotId, spoolman_id: smId });
+        closeSpoolModal();
+        await tick();
+      } catch (e) {
+        if (info) info.textContent = t('spoolman.error', { msg: e.message || String(e) });
+      }
+    };
+  }
 }
 
 function renderMoonHistory(state, connectedBoxes) {
@@ -304,7 +442,7 @@ function renderMoonHistory(state, connectedBoxes) {
   if (!hist.length) {
     const empty = document.createElement("div");
     empty.className = "tag muted";
-    empty.textContent = "Keine Moonraker-History Daten";
+    empty.textContent = t('moon.empty');
     wrap.appendChild(empty);
     return;
   }
@@ -328,7 +466,7 @@ function renderMoonHistory(state, connectedBoxes) {
 
     const job = document.createElement("div");
     job.className = "moonJob";
-    job.textContent = e.job || "(ohne name)";
+    job.textContent = e.job || t('history.no_name');
 
     const nums = document.createElement("div");
     nums.className = "moonNums";
@@ -367,14 +505,14 @@ function renderMoonHistory(state, connectedBoxes) {
 
     const assignTitle = document.createElement("div");
     assignTitle.className = "assignTitle";
-    assignTitle.textContent = existing ? "Zuordnung (lokal gespeichert)" : "Zu Slot zuordnen (lokal)";
+    assignTitle.textContent = existing ? t('assign.title_existing') : t('assign.title_new');
     assign.appendChild(assignTitle);
 
     // When already assigned: keep UI clean, allow optional edit.
     const editBtn = document.createElement("button");
     editBtn.className = "btn mini";
     editBtn.type = "button";
-    editBtn.textContent = existing ? "Ändern" : "";
+    editBtn.textContent = existing ? t('assign.btn_edit') : "";
     editBtn.style.display = existing ? "inline-flex" : "none";
     editBtn.onclick = () => {
       assign.classList.toggle("assigned");
@@ -393,7 +531,7 @@ function renderMoonHistory(state, connectedBoxes) {
       if (selKey) sel.dataset.selkey = selKey;
       const opt0 = document.createElement("option");
       opt0.value = "";
-      opt0.textContent = "— Slot wählen —";
+      opt0.textContent = t('assign.select_default');
       sel.appendChild(opt0);
       for (const sid of slotIds) {
         const o = document.createElement("option");
@@ -414,13 +552,13 @@ function renderMoonHistory(state, connectedBoxes) {
         perColor.push({ color: c, g });
       }
     } else if (gTotal != null && gTotal > 0) {
-      perColor.push({ color: "gesamt", g: Number(gTotal) });
+      perColor.push({ color: t('assign.total'), g: Number(gTotal) });
     }
 
     if (!perColor.length) {
       const note = document.createElement("div");
       note.className = "tag muted";
-      note.textContent = "Kein Verbrauch in History gefunden";
+      note.textContent = t('moon.no_consumption');
       assign.appendChild(note);
     } else {
       // Build UI rows
@@ -447,7 +585,7 @@ function renderMoonHistory(state, connectedBoxes) {
       actions.className = "assignActions";
       const btn = document.createElement("button");
       btn.className = "btn";
-      btn.textContent = existing ? "Zuordnung aktualisieren" : "Zuordnen";
+      btn.textContent = existing ? t('assign.btn_update') : t('assign.btn_assign');
       btn.onclick = async () => {
         try {
           const alloc = {};
@@ -457,7 +595,7 @@ function renderMoonHistory(state, connectedBoxes) {
             alloc[sid] = (alloc[sid] || 0) + Number(it.g || 0);
           }
           if (!Object.keys(alloc).length) {
-            alert("Bitte mindestens einen Slot wählen.");
+            alert(t('assign.alert_select'));
             return;
           }
           const payload = { job_key: key, job: e.job || "", ts: Number(e.ts_end || e.ts_start || 0), alloc_g: alloc };
@@ -465,7 +603,7 @@ function renderMoonHistory(state, connectedBoxes) {
           // Force refresh
           await tick();
         } catch (err) {
-          alert("Konnte nicht speichern: " + (err && err.message ? err.message : String(err)));
+          alert(t('assign.error_save') + (err && err.message ? err.message : String(err)));
         }
       };
       actions.appendChild(btn);
@@ -475,7 +613,7 @@ function renderMoonHistory(state, connectedBoxes) {
         info.className = "tag";
         const parts = [];
         for (const [sid, g] of Object.entries(existing)) parts.push(`${sid}: ${fmtG(g)}`);
-        info.textContent = "Aktuell: " + parts.join(" · ");
+        info.textContent = t('assign.current') + parts.join(" · ");
         actions.appendChild(info);
       }
       assign.appendChild(actions);
@@ -536,7 +674,7 @@ function renderHistory(state, slots, connectedBoxes) {
 
     const nm = document.createElement("div");
     nm.className = "histSlotName";
-    nm.textContent = `Box ${sid[0]} · Slot ${sid[1]}` + (sid === active ? " · aktiv" : "");
+    nm.textContent = `Box ${sid[0]} · Slot ${sid[1]}` + (sid === active ? t('history.active_suffix') : "");
     title.appendChild(nm);
 
     head.appendChild(title);
@@ -561,7 +699,7 @@ function renderHistory(state, slots, connectedBoxes) {
     if (!entries.length) {
       const empty = document.createElement("div");
       empty.className = "tag muted";
-      empty.textContent = "Noch keine Daten";
+      empty.textContent = t('history.no_data');
       list.appendChild(empty);
     } else {
       for (const e of entries) {
@@ -575,7 +713,7 @@ function renderHistory(state, slots, connectedBoxes) {
 
         const job = document.createElement("div");
         job.className = "histJob";
-        job.textContent = (e.job || "(ohne name)");
+        job.textContent = (e.job || t('history.no_name'));
 
         const nums = document.createElement("div");
         nums.className = "histNums";
@@ -614,7 +752,7 @@ function render(state) {
   const cfsBadge = $("cfsBadge");
 
   const printerOk = !!state.printer_connected;
-  badge(printerBadge, printerOk ? "Printer: verbunden" : "Printer: getrennt", printerOk ? "ok" : "bad");
+  badge(printerBadge, printerOk ? t('badge.printer_ok') : t('badge.printer_off'), printerOk ? "ok" : "bad");
   if (!printerOk && state.printer_last_error) {
     printerBadge.textContent += " (" + state.printer_last_error + ")";
   }
@@ -622,7 +760,7 @@ function render(state) {
   const cfsOk = !!state.cfs_connected;
   badge(
     cfsBadge,
-    cfsOk ? ("CFS: erkannt · " + fmtTs(state.cfs_last_update)) : "CFS: —",
+    cfsOk ? t('badge.cfs_ok', {ts: fmtTs(state.cfs_last_update)}) : t('badge.cfs_off'),
     cfsOk ? "ok" : "warn"
   );
 
@@ -665,6 +803,11 @@ function render(state) {
       spool_epoch: (local.spool_epoch ?? null),
       spool_ref_remaining_g: (local.spool_ref_remaining_g ?? null),
       spool_ref_consumed_g: (local.spool_ref_consumed_g ?? null),
+
+      // Spoolman
+      spoolman_id: (local.spoolman_id ?? null),
+      name: (local.name ?? ''),
+      manufacturer: (local.manufacturer ?? local.vendor ?? ''),
     };
     return out;
   };
@@ -780,12 +923,14 @@ async function tick() {
     const scrollTop = rightCol ? rightCol.scrollTop : null;
     const r = await fetch("/api/ui/state", { cache: "no-store" });
     const j = await r.json();
-    render(j.result || j);
+    const st = j.result || j;
+    spoolmanConfigured = !!st.spoolman_configured;
+    render(st);
     restoreUiState();
     if (rightCol && scrollTop != null) rightCol.scrollTop = scrollTop;
   } catch (e) {
-    badge($("printerBadge"), "Printer: —", "warn");
-    badge($("cfsBadge"), "CFS: —", "warn");
+    badge($("printerBadge"), t('badge.printer_dash'), "warn");
+    badge($("cfsBadge"), t('badge.cfs_off'), "warn");
   }
 }
 
@@ -832,7 +977,25 @@ function initRefreshControls() {
   applyRefreshTimer();
 }
 
+function initLangSwitcher() {
+  const btns = document.querySelectorAll('.langBtn');
+  function updateActive() {
+    const cur = i18nLang();
+    for (const b of btns) b.classList.toggle('active', b.dataset.lang === cur);
+  }
+  for (const b of btns) {
+    b.addEventListener('click', () => {
+      i18nSetLang(b.dataset.lang);
+      updateActive();
+      tick(); // re-render dynamic content with new language
+    });
+  }
+  updateActive();
+}
+
 function boot() {
+  i18nSetLang(i18nDetectLang());
+  initLangSwitcher();
   initSpoolModal();
   initRefreshControls();
   tick();
