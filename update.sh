@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_DIR="/opt/filament-management"
 SERVICE_NAME="filament-management"
-REPO_URL="https://github.com/koen01/Filament-Management.git"
+REPO_URL="https://github.com/koen01/CFSync.git"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "Please run with sudo"
@@ -16,7 +16,7 @@ if [[ -z "$REAL_USER" || "$REAL_USER" == "root" ]]; then
   exit 1
 fi
 
-echo "Updating Filament Management..."
+echo "Updating CFSync..."
 
 rm -rf /tmp/filament-update
 git clone --depth 1 "$REPO_URL" /tmp/filament-update
