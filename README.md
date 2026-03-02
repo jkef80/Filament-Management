@@ -50,19 +50,19 @@ Settings are stored in `data/config.json`:
 
 ## Spoolman — RFID auto-linking
 
-CFSync can automatically link a CFS slot to the correct Spoolman spool when an RFID tag is detected — no manual selection needed.
+When an RFID-tagged spool is inserted into a CFS slot, CFSync automatically links it to the correct Spoolman spool — no manual selection needed. There are two mechanisms, used together:
 
-**How it works:** when you manually link a spool to a slot (via the slot modal), CFSync writes the slot's RFID tag ID into a custom extra field on that spool in Spoolman (`cfs_rfid`). Next time the same RFID tag is detected in any slot, CFSync looks up the matching spool and links it automatically.
+**1. Serial number via SSH (primary — works instantly with CFTag-tagged spools)**
 
-**Setup in Spoolman:**
+CFTag writes the Spoolman spool ID directly onto the RFID chip as its serial number. When CFSync detects a new RFID spool, it SSHes into the printer and reads the spool data file to extract the serial number. If it matches a Spoolman spool ID, the slot is linked immediately — no prior setup or manual linking required.
+
+**2. RFID code via Spoolman extra field (fallback)**
+
+When you manually link a spool via the CFSync slot modal, CFSync stores the slot's RFID code in a `cfs_rfid` extra field on that spool in Spoolman. Next time the same tag is detected in any slot, CFSync looks it up and auto-links. This requires the extra field to be pre-created in Spoolman:
 
 1. Open Spoolman → **Settings** → **Extra fields**
-2. Add a new extra field:
-   - **Name:** `cfs_rfid`
-   - **Field type:** Text
-3. Save — no further configuration needed
-
-After that, just link each physical spool once via the CFSync slot modal while the spool is loaded. The RFID is written to Spoolman automatically. From then on, inserting that spool into any CFS slot will auto-link it.
+2. Add a new field: **Name** `cfs_rfid`, **Field type** Text
+3. Save
 
 ![Spoolman link modal](docs/spoolman-link.png)
 
