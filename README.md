@@ -23,7 +23,7 @@ A local web dashboard for managing filament spools on **Creality K1 series print
 ## Install
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/koen01/Filament-Management/main/install.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/koen01/CFSync/main/install.sh)
 ```
 
 The installer will prompt for:
@@ -83,7 +83,7 @@ From this point on, inserting that spool into any CFS slot will auto-link it —
 ## Update
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/koen01/Filament-Management/main/update.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/koen01/CFSync/main/update.sh)
 ```
 
 ## Logs
