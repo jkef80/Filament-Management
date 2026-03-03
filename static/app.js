@@ -513,8 +513,16 @@ function makeSpoolSvg(meta) {
   const bright = hexBrightness(c);
   const tick  = bright > 145 ? 'rgba(0,0,0,0.28)' : 'rgba(255,255,255,0.18)';
 
+  // Filament fill radius: area-proportional so it matches how a real spool empties.
+  // At 100% the colored disk reaches the outer rim (r=36); at 0% it shrinks to the hub (r=10).
+  const pct = (meta.percent != null) ? Math.max(0, Math.min(100, meta.percent)) / 100 : 1.0;
+  const R_OUTER = 36, R_CORE = 10;
+  const filR = Math.round(Math.sqrt(R_CORE * R_CORE + (R_OUTER * R_OUTER - R_CORE * R_CORE) * pct) * 10) / 10;
+  const filamentDisk = filR > R_CORE + 0.5 ? `<circle cx="40" cy="40" r="${filR}" fill="${c}"/>` : '';
+
   return `<svg viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <circle cx="40" cy="40" r="36" fill="${c}" stroke="#141720" stroke-width="3"/>
+    <circle cx="40" cy="40" r="36" fill="#1e2230" stroke="#141720" stroke-width="3"/>
+    ${filamentDisk}
     <circle cx="40" cy="40" r="20" fill="none" stroke="${tick}" stroke-width="1.5"/>
     <line x1="40" y1="22" x2="40" y2="29" stroke="${tick}" stroke-width="2.5" stroke-linecap="round"/>
     <line x1="40" y1="51" x2="40" y2="58" stroke="${tick}" stroke-width="2.5" stroke-linecap="round"/>
