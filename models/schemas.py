@@ -45,6 +45,12 @@ class SlotState(BaseModel):
         return "OTHER"
 
 
+class SlotStats(BaseModel):
+    total_meters: float = 0.0
+    total_kg: float = 0.0
+    last_used_at: Optional[float] = None  # Unix timestamp
+
+
 class AppState(BaseModel):
     active_slot: Optional[str] = None  # legacy; frontend uses cfs_active_slot
     auto_mode: bool = False
@@ -64,6 +70,9 @@ class AppState(BaseModel):
     # Per-slot cumulative usedMaterialLength (m) from last WS snapshot.
     # Used to compute Spoolman usage deltas between updates.
     ws_slot_length_m: Dict[str, float] = Field(default_factory=dict)
+
+    # Lifetime wear stats per slot (cumulative meters, kg, last usage)
+    cfs_stats: Dict[str, SlotStats] = Field(default_factory=dict)
 
     # Printer identity from WS status messages
     printer_name: str = ""

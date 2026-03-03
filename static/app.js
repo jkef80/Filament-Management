@@ -369,121 +369,75 @@ function initSpoolModal() {
 }
 
 
-async function fetchAndRenderSpoolmanStatus(activeSlot, state) {
+function fmtRelative(ts) {
+  if (!ts) return '—';
+  const secs = Math.floor(Date.now() / 1000 - ts);
+  if (secs < 60) return 'just now';
+  if (secs < 3600) return Math.floor(secs / 60) + 'm ago';
+  if (secs < 86400) return Math.floor(secs / 3600) + 'h ago';
+  if (secs < 86400 * 30) return Math.floor(secs / 86400) + 'd ago';
+  return Math.floor(secs / (86400 * 30)) + 'mo ago';
+}
+
+function renderCfsStats(state) {
   const wrap = $("slotHistory");
   if (!wrap) return;
-
-  const slot = activeSlot || null;
-
   wrap.innerHTML = '';
-  const loading = document.createElement('div');
-  loading.className = 'tag muted';
-  loading.textContent = 'Loading spool data…';
-  wrap.appendChild(loading);
 
-  if (!spoolmanConfigured) {
-    wrap.innerHTML = '';
-    const msg = document.createElement('div');
-    msg.className = 'tag muted';
-    msg.textContent = 'Spoolman not configured';
-    wrap.appendChild(msg);
-    return;
-  }
+  const stats = state.cfs_stats || {};
 
-  if (!slot) {
-    wrap.innerHTML = '';
-    const msg = document.createElement('div');
-    msg.className = 'tag muted';
-    msg.textContent = 'No spool linked';
-    wrap.appendChild(msg);
-    return;
-  }
+  for (let b = 1; b <= 4; b++) {
+    const slotIds = ['A', 'B', 'C', 'D'].map(l => `${b}${l}`);
 
-  try {
-    const r = await fetch(`/api/ui/spoolman/spool_detail?slot=${encodeURIComponent(slot)}`, { cache: 'no-store' });
-    const data = await r.json();
-    wrap.innerHTML = '';
-
-    if (!data.linked) {
-      const msg = document.createElement('div');
-      msg.className = 'tag muted';
-      msg.textContent = 'No spool linked';
-      wrap.appendChild(msg);
-      return;
+    let boxMeters = 0, boxKg = 0;
+    for (const sid of slotIds) {
+      const s = stats[sid];
+      if (s) { boxMeters += s.total_meters || 0; boxKg += s.total_kg || 0; }
     }
 
-    if (!data.spool) {
-      const msg = document.createElement('div');
-      msg.className = 'tag muted';
-      msg.textContent = 'Spoolman unreachable';
-      wrap.appendChild(msg);
-      return;
+    const boxDiv = document.createElement('div');
+    boxDiv.className = 'cfsBox';
+
+    const head = document.createElement('div');
+    head.className = 'cfsBoxHead';
+    const headLabel = document.createElement('span');
+    headLabel.textContent = `Box ${b}`;
+    const headTotals = document.createElement('span');
+    headTotals.className = 'cfsBoxTotals';
+    headTotals.textContent = `${boxMeters.toFixed(1)} m  ·  ${fmtG(boxKg * 1000)}`;
+    head.appendChild(headLabel);
+    head.appendChild(headTotals);
+    boxDiv.appendChild(head);
+
+    for (const sid of slotIds) {
+      const s = stats[sid] || {};
+      const row = document.createElement('div');
+      row.className = 'cfsSlotRow';
+
+      const label = document.createElement('span');
+      label.className = 'cfsSlotLabel';
+      label.textContent = sid;
+
+      const meters = document.createElement('span');
+      meters.className = 'cfsSlotMeters';
+      meters.textContent = ((s.total_meters || 0)).toFixed(1) + ' m';
+
+      const kg = document.createElement('span');
+      kg.className = 'cfsSlotKg';
+      kg.textContent = fmtG((s.total_kg || 0) * 1000);
+
+      const last = document.createElement('span');
+      last.className = 'cfsSlotLast';
+      last.textContent = fmtRelative(s.last_used_at || null);
+
+      row.appendChild(label);
+      row.appendChild(meters);
+      row.appendChild(kg);
+      row.appendChild(last);
+      boxDiv.appendChild(row);
     }
 
-    const sp = data.spool;
-    const filament = sp.filament || {};
-    const filamentName = filament.name || '';
-    const material = (filament.material || '').toUpperCase();
-    const vendor = (filament.vendor || {}).name || '';
-    const colorHex = filament.color_hex
-      ? (filament.color_hex.startsWith('#') ? filament.color_hex : '#' + filament.color_hex)
-      : null;
-
-    const card = document.createElement('div');
-    card.className = 'spoolStatusCard';
-
-    // Filament identity header
-    const header = document.createElement('div');
-    header.className = 'spoolStatusFilament';
-    const swatch = document.createElement('span');
-    swatch.className = 'spoolmanListSwatch';
-    swatch.style.width = '20px';
-    swatch.style.height = '20px';
-    swatch.style.borderRadius = '5px';
-    swatch.style.flexShrink = '0';
-    if (colorHex) swatch.style.background = colorHex;
-    header.appendChild(swatch);
-    const info = document.createElement('div');
-    info.className = 'spoolStatusFilamentInfo';
-    const nameEl = document.createElement('div');
-    nameEl.className = 'spoolStatusFilamentName';
-    nameEl.textContent = [vendor, filamentName].filter(Boolean).join(' · ') || `Spool #${sp.id}`;
-    const subEl = document.createElement('div');
-    subEl.className = 'spoolStatusFilamentSub';
-    subEl.textContent = [material, `#${sp.id}`].filter(Boolean).join(' · ');
-    info.appendChild(nameEl);
-    info.appendChild(subEl);
-    header.appendChild(info);
-    card.appendChild(header);
-
-    const rows = [
-      { label: 'Remaining', value: sp.remaining_weight != null ? fmtG(sp.remaining_weight) : '—' },
-      { label: 'Used total', value: sp.used_weight != null ? fmtG(sp.used_weight) : '—' },
-      { label: 'First used', value: sp.first_used ? fmtTs(new Date(sp.first_used).getTime() / 1000) : '—' },
-      { label: 'Last used', value: sp.last_used ? fmtTs(new Date(sp.last_used).getTime() / 1000) : '—' },
-    ];
-
-    for (const row of rows) {
-      const div = document.createElement('div');
-      div.className = 'spoolStatRow';
-      const lbl = document.createElement('span');
-      lbl.className = 'spoolStatLabel';
-      lbl.textContent = row.label;
-      const val = document.createElement('span');
-      val.className = 'spoolStatValue';
-      val.textContent = row.value;
-      div.appendChild(lbl);
-      div.appendChild(val);
-      card.appendChild(div);
-    }
-
-    wrap.appendChild(card);
-  } catch (e) {
-    wrap.innerHTML = '';
-    const msg = document.createElement('div');
-    msg.className = 'tag muted';
-    msg.textContent = 'Spoolman unreachable';
-    wrap.appendChild(msg);
+    wrap.appendChild(boxDiv);
   }
 }
 
@@ -704,8 +658,8 @@ function render(state) {
     boxesGrid.appendChild(makeBoxCard(b));
   }
 
-  // Right-side Spoolman status panel
-  fetchAndRenderSpoolmanStatus(active, state);
+  // Right-side CFS stats panel
+  renderCfsStats(state);
 
   // Active card
   const activeRow = $("activeRow");

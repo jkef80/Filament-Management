@@ -25,6 +25,7 @@ from models.schemas import (
     SelectSlotRequest,
     SetAutoRequest,
     SlotState,
+    SlotStats,
     SpoolmanLinkRequest,
     SpoolmanUnlinkRequest,
     UiSetColorRequest,
@@ -570,6 +571,7 @@ _ssh_last_fetch: float = 0.0
 _moon_last_state: str = ""        # last known print_stats.state from Moonraker
 _moon_last_filament_mm: float = 0.0                   # filament_used at last poll tick
 _moon_job_track_slot_g: Dict[str, float] = {}         # accumulated grams per slot for current job
+_moon_job_track_slot_mm: Dict[str, float] = {}        # accumulated mm per slot for current job
 
 _VALID_SLOT_IDS = frozenset(
     f"{b}{l}" for b in "1234" for l in "ABCD"
@@ -950,7 +952,7 @@ async def printer_ws_loop() -> None:
 
 def _moon_flush_to_spoolman(reason: str) -> None:
     """Sync accumulated per-slot grams to Spoolman and reset job trackers."""
-    global _moon_job_track_slot_g, _moon_last_filament_mm
+    global _moon_job_track_slot_g, _moon_job_track_slot_mm, _moon_last_filament_mm
     st = load_state()
     for slot, g in _moon_job_track_slot_g.items():
         if g <= 0:
@@ -964,13 +966,28 @@ def _moon_flush_to_spoolman(reason: str) -> None:
             print(f"[MOON] {reason}: slot {slot} → {g:.2f}g (no Spoolman link, not synced)")
     if not _moon_job_track_slot_g:
         print(f"[MOON] {reason}: no filament deltas recorded")
+
+    # Persist lifetime stats for each slot that consumed filament this job
+    now = _now()
+    for slot, g in _moon_job_track_slot_g.items():
+        if g <= 0:
+            continue
+        stats = st.cfs_stats.get(slot) or SlotStats()
+        stats.total_kg = round(stats.total_kg + g / 1000.0, 6)
+        stats.total_meters = round(stats.total_meters + _moon_job_track_slot_mm.get(slot, 0.0) / 1000.0, 4)
+        stats.last_used_at = now
+        st.cfs_stats[slot] = stats
+    if any(g > 0 for g in _moon_job_track_slot_g.values()):
+        save_state(st)
+
     _moon_job_track_slot_g = {}
+    _moon_job_track_slot_mm = {}
     _moon_last_filament_mm = 0.0
 
 
 async def moonraker_job_poll_loop() -> None:
     """Poll Moonraker print_stats every 5s; attribute each filament delta to the active slot."""
-    global _moon_last_state, _moon_last_filament_mm, _moon_job_track_slot_g
+    global _moon_last_state, _moon_last_filament_mm, _moon_job_track_slot_g, _moon_job_track_slot_mm
 
     base = _moonraker_base_url()
     if not base:
@@ -996,6 +1013,7 @@ async def moonraker_job_poll_loop() -> None:
             if new_state in _ACTIVE_STATES and prev not in _ACTIVE_STATES:
                 # Job started — reset trackers
                 _moon_job_track_slot_g = {}
+                _moon_job_track_slot_mm = {}
                 _moon_last_filament_mm = filament_used_mm
                 print(f"[MOON] State: {prev!r} → {new_state!r}; tracking filament deltas per active slot")
 
@@ -1011,6 +1029,7 @@ async def moonraker_job_poll_loop() -> None:
                         g = mm_to_g(mat_str, delta_mm)
                         if g > 0:
                             _moon_job_track_slot_g[curr_slot] = _moon_job_track_slot_g.get(curr_slot, 0.0) + g
+                            _moon_job_track_slot_mm[curr_slot] = _moon_job_track_slot_mm.get(curr_slot, 0.0) + delta_mm
 
             elif new_state in {"complete", "error", "cancelled"} and prev in _ACTIVE_STATES:
                 # Capture any final delta, then flush accumulated grams to Spoolman
@@ -1023,6 +1042,7 @@ async def moonraker_job_poll_loop() -> None:
                         g = mm_to_g(mat_str, delta_mm)
                         if g > 0:
                             _moon_job_track_slot_g[curr_slot] = _moon_job_track_slot_g.get(curr_slot, 0.0) + g
+                            _moon_job_track_slot_mm[curr_slot] = _moon_job_track_slot_mm.get(curr_slot, 0.0) + delta_mm
                 print(f"[MOON] State: {prev!r} → {new_state!r}; {filament_used_mm:.0f}mm total filament used")
                 _moon_flush_to_spoolman(f"Job {new_state}")
 
@@ -1103,6 +1123,7 @@ def _ui_state_dict(state: AppState) -> dict:
     d.setdefault("cfs_last_update", 0.0)
     d.setdefault("cfs_active_slot", None)
     d.setdefault("cfs_slots", {})
+    d.setdefault("cfs_stats", {})
     d["spoolman_configured"] = bool(_spoolman_base_url())
     d["spoolman_url"] = _spoolman_base_url()
 
