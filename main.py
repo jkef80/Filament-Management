@@ -567,9 +567,9 @@ _ws_last_state: Dict[str, int] = {}  # slot → last seen CFS state (0/1/2)
 _SSH_FETCH_COOLDOWN = 30.0  # seconds between SSH fetches of material_box_info.json
 _ssh_last_fetch: float = 0.0
 
-_moon_last_state: str = ""  # last known print_stats.state from Moonraker
-_moon_job_start_lengths: Dict[str, float] = {}  # ws_slot_length_m snapshot at job start
-_moon_snapshot_pending: bool = False  # True when snapshot was empty (WS not ready), retry next tick
+_moon_last_state: str = ""        # last known print_stats.state from Moonraker
+_moon_last_filament_mm: float = 0.0                   # filament_used at last poll tick
+_moon_job_track_slot_g: Dict[str, float] = {}         # accumulated grams per slot for current job
 
 _VALID_SLOT_IDS = frozenset(
     f"{b}{l}" for b in "1234" for l in "ABCD"
@@ -948,54 +948,29 @@ async def printer_ws_loop() -> None:
         backoff = min(backoff * 2, 60.0)
 
 
-def _moon_report_job_usage(filament_mm: float) -> None:
-    """Attribute Moonraker's filament_used proportionally across slots using WS deltas."""
-    global _moon_job_start_lengths
+def _moon_flush_to_spoolman(reason: str) -> None:
+    """Sync accumulated per-slot grams to Spoolman and reset job trackers."""
+    global _moon_job_track_slot_g, _moon_last_filament_mm
     st = load_state()
-    slot_deltas: Dict[str, float] = {}
-    for slot, cur_m in st.ws_slot_length_m.items():
-        start_m = _moon_job_start_lengths.get(slot, cur_m)
-        delta = cur_m - start_m
-        if delta > 0.01:
-            slot_deltas[slot] = delta
-    total_delta_m = sum(slot_deltas.values())
-    if not slot_deltas or total_delta_m <= 0:
-        # Fallback: attribute to active CFS slot when WS deltas are unavailable
-        # (e.g. service restarted mid-print or WS wasn't connected at job start)
-        active = st.cfs_active_slot or st.active_slot
-        slot_obj = st.slots.get(active) if active else None
+    for slot, g in _moon_job_track_slot_g.items():
+        if g <= 0:
+            continue
+        slot_obj = st.slots.get(slot)
         spool_id = getattr(slot_obj, "spoolman_id", None) if slot_obj else None
         if spool_id:
-            mat_str = str(getattr(slot_obj, "material", "OTHER") or "OTHER")
-            g = mm_to_g(mat_str, filament_mm)
-            if g > 0:
-                _spoolman_report_usage(spool_id, g)
-                print(f"[MOON] Job complete: {filament_mm:.0f}mm → {g:.2f}g attributed to slot {active} (active slot fallback, no WS deltas)")
-            else:
-                print(f"[MOON] Job complete: {filament_mm:.0f}mm used, could not compute grams for slot {active}")
-        else:
-            print(f"[MOON] Job complete: {filament_mm:.0f}mm used, no WS slot deltas and no linked active slot to fall back to")
-        _moon_job_start_lengths = {}
-        return
-    for slot, delta_m in slot_deltas.items():
-        slot_obj = st.slots.get(slot)
-        if not slot_obj:
-            continue
-        spool_id = getattr(slot_obj, "spoolman_id", None)
-        if not spool_id:
-            continue
-        proportion = delta_m / total_delta_m
-        mat_str = str(getattr(slot_obj, "material", "OTHER") or "OTHER")
-        g = mm_to_g(mat_str, filament_mm * proportion)
-        if g > 0:
             _spoolman_report_usage(spool_id, g)
-            print(f"[MOON] Slot {slot}: {g:.2f}g ({proportion * 100:.0f}% of job)")
-    _moon_job_start_lengths = {}
+            print(f"[MOON] {reason}: slot {slot} → {g:.2f}g synced to Spoolman spool {spool_id}")
+        else:
+            print(f"[MOON] {reason}: slot {slot} → {g:.2f}g (no Spoolman link, not synced)")
+    if not _moon_job_track_slot_g:
+        print(f"[MOON] {reason}: no filament deltas recorded")
+    _moon_job_track_slot_g = {}
+    _moon_last_filament_mm = 0.0
 
 
 async def moonraker_job_poll_loop() -> None:
-    """Poll Moonraker print_stats every 5s and attribute filament usage at job completion."""
-    global _moon_last_state, _moon_job_start_lengths, _moon_snapshot_pending
+    """Poll Moonraker print_stats every 5s; attribute each filament delta to the active slot."""
+    global _moon_last_state, _moon_last_filament_mm, _moon_job_track_slot_g
 
     base = _moonraker_base_url()
     if not base:
@@ -1005,7 +980,6 @@ async def moonraker_job_poll_loop() -> None:
     print(f"[MOON] Starting job poll loop against {base}")
 
     _ACTIVE_STATES = {"printing", "paused"}
-    _ENDED_STATES = {"complete", "error", "cancelled", "standby"}
 
     while True:
         await asyncio.sleep(5.0)
@@ -1016,43 +990,43 @@ async def moonraker_job_poll_loop() -> None:
             new_state = str(ps.get("state") or "").lower()
             filament_used_mm = float(ps.get("filament_used") or 0)
 
-            # Re-snapshot if startup race left us with an empty snapshot
-            if _moon_snapshot_pending and new_state in _ACTIVE_STATES:
-                st_ws = load_state()
-                if st_ws.ws_slot_length_m:
-                    _moon_job_start_lengths = dict(st_ws.ws_slot_length_m)
-                    _moon_snapshot_pending = False
-                    print(f"[MOON] Re-snapshotted {len(_moon_job_start_lengths)} slot lengths (WS now ready)")
-
             prev = _moon_last_state
-            if new_state == prev:
-                continue
-
             _moon_last_state = new_state
-            print(f"[MOON] State: {prev!r} → {new_state!r}")
 
             if new_state in _ACTIVE_STATES and prev not in _ACTIVE_STATES:
-                # Job started — snapshot current ws_slot_length_m
-                st = load_state()
-                _moon_job_start_lengths = dict(st.ws_slot_length_m)
-                if not _moon_job_start_lengths:
-                    _moon_snapshot_pending = True
-                    print("[MOON] Job started; WS not ready yet, will re-snapshot when data arrives")
-                else:
-                    _moon_snapshot_pending = False
-                    print(f"[MOON] Job started; snapshotted {len(_moon_job_start_lengths)} slot lengths")
+                # Job started — reset trackers
+                _moon_job_track_slot_g = {}
+                _moon_last_filament_mm = filament_used_mm
+                print(f"[MOON] State: {prev!r} → {new_state!r}; tracking filament deltas per active slot")
 
-            elif new_state == "complete" and prev in _ACTIVE_STATES:
-                _moon_snapshot_pending = False
-                print(f"[MOON] Job complete: {filament_used_mm:.0f}mm filament used")
-                _moon_report_job_usage(filament_used_mm)
+            elif new_state in _ACTIVE_STATES:
+                # Still printing/paused — attribute delta to currently active slot
+                delta_mm = max(0.0, filament_used_mm - _moon_last_filament_mm)
+                _moon_last_filament_mm = filament_used_mm
+                if delta_mm > 0:
+                    st = load_state()
+                    curr_slot = st.cfs_active_slot or st.active_slot
+                    if curr_slot and curr_slot in st.slots:
+                        mat_str = str(getattr(st.slots[curr_slot], "material", "OTHER") or "OTHER")
+                        g = mm_to_g(mat_str, delta_mm)
+                        if g > 0:
+                            _moon_job_track_slot_g[curr_slot] = _moon_job_track_slot_g.get(curr_slot, 0.0) + g
 
-            elif new_state in {"error", "cancelled"} and prev in _ACTIVE_STATES:
-                _moon_snapshot_pending = False
-                print(f"[MOON] Job {new_state} — skipping usage report")
-                _moon_job_start_lengths = {}
+            elif new_state in {"complete", "error", "cancelled"} and prev in _ACTIVE_STATES:
+                # Capture any final delta, then flush accumulated grams to Spoolman
+                delta_mm = max(0.0, filament_used_mm - _moon_last_filament_mm)
+                if delta_mm > 0:
+                    st = load_state()
+                    curr_slot = st.cfs_active_slot or st.active_slot
+                    if curr_slot and curr_slot in st.slots:
+                        mat_str = str(getattr(st.slots[curr_slot], "material", "OTHER") or "OTHER")
+                        g = mm_to_g(mat_str, delta_mm)
+                        if g > 0:
+                            _moon_job_track_slot_g[curr_slot] = _moon_job_track_slot_g.get(curr_slot, 0.0) + g
+                print(f"[MOON] State: {prev!r} → {new_state!r}; {filament_used_mm:.0f}mm total filament used")
+                _moon_flush_to_spoolman(f"Job {new_state}")
 
-        except Exception as e:
+        except Exception:
             # Network errors are expected when printer is off — don't log verbosely
             pass
 
