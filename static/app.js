@@ -386,7 +386,11 @@ function renderCfsStats(state) {
 
   const stats = state.cfs_stats || {};
 
-  for (let b = 1; b <= 4; b++) {
+  const boxesMeta = (state.cfs_slots || {})['_boxes'] || {};
+  const activeBoxIds = Object.keys(boxesMeta).map(Number).filter(n => n >= 1 && n <= 4).sort();
+  const boxIds = activeBoxIds.length ? activeBoxIds : [1, 2, 3, 4];
+
+  for (const b of boxIds) {
     const slotIds = ['A', 'B', 'C', 'D'].map(l => `${b}${l}`);
 
     let boxMeters = 0, boxKg = 0;
