@@ -586,7 +586,7 @@ _spoolman_pct_refresh_at: Dict[str, float] = {}      # slot → next refresh tim
 _SPOOLMAN_PCT_TTL = 60.0
 
 # Known WS key names for printer identity (tried in order)
-_WS_NAME_KEYS = ("machineName", "printerName", "deviceName", "model", "MachineModel", "deviceModel")
+_WS_NAME_KEYS = ("hostname", "machineName", "printerName", "deviceName", "model", "MachineModel", "deviceModel")
 _WS_FW_KEYS   = ("softVersion", "firmwareVersion", "version", "FirmwareVersion", "SoftwareVersion", "firmware")
 
 
@@ -650,6 +650,17 @@ def _parse_ws_printer_info(payload: dict) -> None:
         if v:
             fw = v
             break
+    # Parse "modelVersion" field: "printer hw ver:;printer sw ver:;DWIN sw ver:1.1.3.13;"
+    if not fw:
+        mv = str(payload.get("modelVersion") or "").strip()
+        if mv:
+            for part in mv.split(";"):
+                part = part.strip()
+                if "sw ver:" in part.lower() and ":" in part:
+                    ver = part.split(":", 1)[1].strip()
+                    if ver:
+                        fw = ver
+                        break
 
     if not name and not fw:
         return
