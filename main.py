@@ -862,11 +862,16 @@ async def _refresh_manual_slot_pcts() -> None:
 async def _ws_connect_and_run(ws_url: str) -> None:
     """Open one WebSocket connection to the printer and run the polling loop."""
     async with websockets.connect(ws_url, ping_interval=None, ping_timeout=None) as ws:
-        # Skip only the very first burst (max 5 messages, 0.15 s each).
-        # We keep this minimal — real CFS data arrives immediately and we must not lose it.
+        # Consume the very first burst (max 5 messages, 0.15 s each).
+        # Parse for printer identity (hostname/modelVersion) but skip CFS data,
+        # which may be stale at this point.
         for _ in range(5):
             try:
-                await asyncio.wait_for(ws.recv(), timeout=0.15)
+                msg = await asyncio.wait_for(ws.recv(), timeout=0.15)
+                try:
+                    _parse_ws_printer_info(json.loads(msg))
+                except Exception:
+                    pass
             except asyncio.TimeoutError:
                 break
 
