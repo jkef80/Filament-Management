@@ -503,16 +503,14 @@ function render(state) {
     }
   }
 
-  // Update heading, tab title and subtitle with printer identity from WS
-  const printerTitle = $("printerTitle");
-  if (printerTitle && state.printer_name) {
-    printerTitle.textContent = state.printer_name;
-    document.title = state.printer_name;
+  // Update tab title and subtitle with printer identity from WS
+  if (state.printer_name) {
+    document.title = state.printer_name + " · CFSync";
   }
   const sub = $("printerSubtitle");
   if (sub) {
-    const parts = [state.printer_firmware].filter(Boolean);
-    sub.textContent = parts.length ? parts.join(" · ") : "";
+    const parts = [state.printer_name, state.printer_firmware].filter(Boolean);
+    sub.textContent = parts.length ? parts.join(" · ") : "Connecting…";
   }
 
   const printerBadge = $("printerBadge");
