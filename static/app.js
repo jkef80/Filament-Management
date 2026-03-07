@@ -162,10 +162,6 @@ function openSpoolModal(slotId, meta) {
   if (title) title.textContent = `Box ${slotId[0]} · Slot ${slotId[1]}`;
   if (sub) sub.textContent = `${meta.material || '—'} · ${(meta.color || '').toUpperCase() || '—'}`;
 
-  // New roll input stays empty by default
-  const startEl = $('spoolStart');
-  if (startEl) startEl.value = '';
-
   // --- Spoolman section ---
   const smSec = $('spoolmanSection');
   if (smSec) {
@@ -294,20 +290,6 @@ function initSpoolModal() {
       closeSpoolModal();
     }
   });
-
-  const saveStart = $('spoolSaveStart');
-
-  if (saveStart) {
-    saveStart.onclick = async (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      if (!spoolSlotId) return;
-      // Rollwechsel: new epoch + auto-unlink Spoolman
-      await postJson('/api/ui/spool/set_start', { slot: spoolSlotId });
-      closeSpoolModal();
-      await tick();
-    };
-  }
 
   // --- Spoolman button handlers ---
   const smLink = $('spoolmanLink');
