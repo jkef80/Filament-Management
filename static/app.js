@@ -766,10 +766,53 @@ function initFluiddBookmarklet() {
   }
 }
 
+function initFluiddUserscript() {
+  const btn = document.getElementById('fluiddUserscriptBtn');
+  if (!btn) return;
+  btn.onclick = async () => {
+    const origin = window.location.origin;
+    const fluiddUrl = prompt(
+      'Enter your Fluidd URL (e.g. http://192.168.1.100)\nThis will be used for the @match rule so the script only runs on Fluidd:',
+      'http://192.168.1.100'
+    );
+    if (!fluiddUrl) return;
+
+    const matchUrl = fluiddUrl.replace(/\/$/, '') + '/*';
+    const script = [
+      '// ==UserScript==',
+      '// @name         CFSync — Fluidd Panel',
+      '// @namespace    http://tampermonkey.net/',
+      '// @version      1.0',
+      '// @description  Shows live CFS slot status in Fluidd\'s Runout Sensors card',
+      '// @match        ' + matchUrl,
+      '// @grant        none',
+      '// ==/UserScript==',
+      '',
+      '(function () {',
+      "  'use strict';",
+      "  window.CFSYNC_URL = '" + origin + "';",
+      "  var s = document.createElement('script');",
+      "  s.src = window.CFSYNC_URL + '/static/fluidd-panel.js?v=1&t=' + Date.now();",
+      "  document.head.appendChild(s);",
+      '})();',
+    ].join('\n');
+
+    try {
+      await navigator.clipboard.writeText(script);
+      const prev = btn.textContent;
+      btn.textContent = '✓ Copied!';
+      setTimeout(() => { btn.textContent = prev; }, 2500);
+    } catch (_) {
+      prompt('Copy this userscript and paste it into Tampermonkey → New Script:', script);
+    }
+  };
+}
+
 function boot() {
   initSpoolModal();
   initRefreshControls();
   initFluiddBookmarklet();
+  initFluiddUserscript();
   tick();
 }
 
