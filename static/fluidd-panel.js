@@ -135,7 +135,7 @@
         // Color swatch
         const dot = document.createElement('div');
         dot.className = 'cfsp-dot';
-        const rawColor = (cfs.color || cfs.color_hex || local.color_hex || '').toString().toLowerCase();
+        const rawColor = (cfs.color || cfs.color_hex || local.color || local.color_hex || '').toString().toLowerCase();
         if (rawColor && cfs.present !== false) {
           dot.style.background = rawColor.startsWith('#') ? rawColor : '#' + rawColor;
         }

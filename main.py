@@ -730,7 +730,11 @@ def _parse_ws_cfs_data(payload: dict) -> None:
             else:
                 pct = None
 
+            raw_color = mat.get("color", "")
+            col = _normalize_ws_color(raw_color)
+
             st.cfs_slots[slot] = {
+                "color": col if (state_val > 0 and col and col.startswith("#")) else "",
                 "percent": pct,
                 "state": state_val,
                 "rfid": mat.get("rfid", ""),
@@ -744,8 +748,6 @@ def _parse_ws_cfs_data(payload: dict) -> None:
             # Update local slot metadata from CFS data (only if spool is physically present)
             if state_val > 0 and slot in st.slots:
                 slot_obj = st.slots[slot]
-                raw_color = mat.get("color", "")
-                col = _normalize_ws_color(raw_color)
                 if col and len(col) == 7 and col.startswith("#"):
                     slot_obj.color_hex = col
                 mat_type = (mat.get("type") or "").strip().upper()
