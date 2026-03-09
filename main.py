@@ -580,7 +580,7 @@ _VALID_SLOT_IDS = frozenset(
 # Log unknown WS message top-level keys once per session to aid discovery
 _ws_seen_keys: set = set()
 
-# Spoolman-derived percent cache for manual (non-RFID) slots
+# Spoolman-derived percent cache for linked slots (both manual and RFID)
 _spoolman_manual_pct: Dict[str, Optional[int]] = {}  # slot → percent or None
 _spoolman_pct_refresh_at: Dict[str, float] = {}      # slot → next refresh timestamp
 _SPOOLMAN_PCT_TTL = 60.0
@@ -720,11 +720,11 @@ def _parse_ws_cfs_data(payload: dict) -> None:
             state_val = int(mat.get("state") or 0)
             selected = int(mat.get("selected") or 0)
 
-            # state 2 = RFID: WS percent is real sensor data → use it
+            # state 2 = RFID: use Spoolman-based calc (consistent with manual)
             # state 1 = manual: WS always reports 100 (no sensor) → use Spoolman cache
             # state 0 = empty: no percent
             if state_val == 2:
-                pct = mat.get("percent")
+                pct = _spoolman_manual_pct.get(slot)  # None until async refresh fills it
             elif state_val == 1:
                 pct = _spoolman_manual_pct.get(slot)  # None until async refresh fills it
             else:
@@ -771,6 +771,8 @@ def _parse_ws_cfs_data(payload: dict) -> None:
                     st.slots[slot] = slot_obj_swap
                     st.ws_slot_length_m.pop(slot, None)
                     _ws_last_rfid.pop(slot, None)
+                    _spoolman_manual_pct.pop(slot, None)
+                    _spoolman_pct_refresh_at.pop(slot, None)
                     print(f"[CFS] Slot {slot}: state {prev_state}→{state_val}, unlinked Spoolman spool (spool swap)")
 
             # SSH fetch for serialNum-based auto-link whenever a slot freshly becomes RFID
@@ -819,7 +821,7 @@ def _parse_ws_cfs_data(payload: dict) -> None:
 
 
 async def _refresh_manual_slot_pcts() -> None:
-    """Calculate Spoolman-based percent for manual (non-RFID) slots and cache it.
+    """Calculate Spoolman-based percent for all linked slots (manual and RFID) and cache it.
 
     Called after each boxsInfo parse. Uses a per-slot TTL so Spoolman is queried
     at most once per _SPOOLMAN_PCT_TTL seconds per slot.
@@ -832,7 +834,7 @@ async def _refresh_manual_slot_pcts() -> None:
     loop = asyncio.get_running_loop()
 
     for slot, cfs_meta in list(st.cfs_slots.items()):
-        if not isinstance(cfs_meta, dict) or cfs_meta.get("state") != 1:
+        if not isinstance(cfs_meta, dict) or cfs_meta.get("state") not in (1, 2):
             continue
         slot_obj = st.slots.get(slot)
         spool_id = getattr(slot_obj, "spoolman_id", None) if slot_obj else None
@@ -856,7 +858,8 @@ async def _refresh_manual_slot_pcts() -> None:
                 pct = None
             _spoolman_manual_pct[slot] = pct
             _spoolman_pct_refresh_at[slot] = now + _SPOOLMAN_PCT_TTL
-            print(f"[SPOOLMAN] Slot {slot} manual percent: {pct}%")
+            state_label = "RFID" if cfs_meta.get("state") == 2 else "manual"
+            print(f"[SPOOLMAN] Slot {slot} {state_label} percent: {pct}%")
         except Exception:
             _spoolman_pct_refresh_at[slot] = now + 10.0  # back off on error
 
