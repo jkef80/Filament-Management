@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Filament-Management is a local web application for tracking 3D printer filament/spool usage, built for Creality K2 Plus CFS (4x4 slot grid) and Klipper/Moonraker-based printers. It runs as a FastAPI backend with a vanilla JavaScript SPA frontend. The UI supports German and English via `static/i18n.js` (auto-detects browser language, persists choice in localStorage).
+CFSync is a local web application for tracking 3D printer filament/spool usage, built for Creality K2 Plus CFS (4x4 slot grid) and Klipper/Moonraker-based printers. It runs as a FastAPI backend with a vanilla JavaScript SPA frontend.
 
 ## Development Commands
 
@@ -27,9 +27,9 @@ There are no automated tests, linting tools, or CI/CD pipelines configured.
 
 **Backend:** Single-file FastAPI app (`main.py`, ~1500 lines) with Pydantic models in `models/schemas.py`. Data is persisted as JSON files in `data/` (state.json, config.json, profiles.json) — no database.
 
-**Frontend:** Vanilla JS SPA in `static/` (index.html, app.js, app.css, style.css). No build step, no framework — pure DOM manipulation.
+**Frontend:** Vanilla JS SPA in `static/` (index.html, app.js, app.css, style.css). No build step, no framework — pure DOM manipulation. `fluidd-panel.js` is a standalone script injected into the Fluidd UI via bookmarklet or Tampermonkey userscript (generated from the settings page).
 
-**Moonraker integration:** Optional async background polling loop that queries the printer's Moonraker API for print job status, filament usage, and CFS slot info. Includes Creality K2 Plus-specific object parsing (box.T1-T4, filament_rack).
+**Moonraker integration:** Optional async background polling loop that queries the printer's Moonraker API for print job status, filament usage, and CFS slot info. Includes Creality K2 Plus-specific object parsing (box.T1-T4, filament_rack). Printer identity (`printer_name`, `printer_firmware`) is parsed from the Moonraker WebSocket.
 
 ## Key Patterns
 
@@ -44,7 +44,11 @@ There are no automated tests, linting tools, or CI/CD pipelines configured.
 
 ## Spoolman Integration (Optional)
 
-Set `spoolman_url` in `data/config.json` to enable. This app acts as the only bridge between Spoolman and the printer (Moonraker's Spoolman plugin is not used). Spools are linked manually via the slot modal dropdown. On link, `remaining_weight` is imported from Spoolman. Consumption is synced back via `PUT /api/v1/spool/{id}/use` (fire-and-forget) when prints finalize or manual allocations are made. Roll changes auto-unlink the Spoolman spool. All Spoolman calls are best-effort and never block local tracking.
+Set `spoolman_url` in `data/config.json` to enable. This app acts as the only bridge between Spoolman and the printer (Moonraker's Spoolman plugin is not used). Spools are linked manually via the slot modal dropdown or auto-linked by RFID tag (`_spoolman_autolink_by_rfid()`). On link, `remaining_weight` is imported from Spoolman. Consumption is synced back via `PUT /api/v1/spool/{id}/use` (fire-and-forget) when prints finalize or manual allocations are made. Roll changes auto-unlink the Spoolman spool. All Spoolman calls are best-effort (`_spoolman_*` helpers) and never block local tracking.
+
+**Spoolman API endpoints:** `GET /api/ui/spoolman/spools`, `POST /api/ui/spoolman/link`, `POST /api/ui/spoolman/unlink`, `GET /api/ui/spoolman/spool_detail`.
+
+**Percentage calculation:** For RFID-linked spools, remaining % is calculated the same way as manual spools — using Spoolman's `remaining_weight` divided by the spool's initial weight.
 
 ## Production Deployment
 
