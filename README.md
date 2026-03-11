@@ -42,6 +42,19 @@ Settings are stored in `data/config.json`:
 
 ```json
 {
+  "printers": [
+    { "id": "Creality k2 Pro", "address": "192.168.1.144" },
+    { "id": "Creality Hi", "address": "192.168.1.145" }
+  ],
+  "filament_diameter_mm": 1.75,
+  "spoolman_url": "http://192.168.1.10:7912"
+}
+```
+
+Alternative (IDs default to IP address):
+
+```json
+{
   "printer_urls": ["192.168.1.144", "192.168.1.145"],
   "filament_diameter_mm": 1.75,
   "spoolman_url": "http://192.168.1.10:7912"

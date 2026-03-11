@@ -789,7 +789,7 @@ function render(ui) {
   if (!printers.length) {
     const empty = document.createElement("div");
     empty.className = "emptyState";
-    empty.textContent = "No printers configured. Set printer_urls in data/config.json and reload.";
+    empty.textContent = "No printers configured. Set printer_urls (or printers) in data/config.json and reload.";
     wrap.appendChild(empty);
     return;
   }

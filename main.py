@@ -162,6 +162,13 @@ def _normalize_printer_host(raw: str) -> str:
     return host
 
 
+def _normalize_printer_id(raw_id: str, address: str) -> str:
+    rid = (raw_id or "").strip()
+    if rid:
+        return rid
+    return (address or "").strip()
+
+
 def _dedupe_printers(items: List[str]) -> List[str]:
     seen = set()
     out: List[str] = []
@@ -181,6 +188,7 @@ def load_config() -> dict:
         cfg = {}
 
     printer_urls: List[str] = []
+    printers: List[dict] = []
 
     # Backward compat: migrate legacy printer_url into printer_urls
     legacy_printer = _normalize_printer_host(cfg.get("printer_url") or "")
@@ -204,6 +212,76 @@ def load_config() -> dict:
             if host:
                 printer_urls.append(host)
 
+    # Backward/alternate compat: "printers": [{"address": "..."}]
+    raw_printers = cfg.get("printers")
+    if isinstance(raw_printers, list):
+        for item in raw_printers:
+            host = ""
+            if isinstance(item, dict):
+                host = (
+                    item.get("address")
+                    or item.get("host")
+                    or item.get("ip")
+                    or item.get("url")
+                    or item.get("printer_url")
+                    or ""
+                )
+            elif isinstance(item, str):
+                host = item
+            host = _normalize_printer_host(str(host))
+            if host:
+                printer_urls.append(host)
+
+    # Backward/alternate compat: "printers": [{"id": "...", "address": "..."}]
+    raw_printers = cfg.get("printers")
+    if isinstance(raw_printers, list):
+        for item in raw_printers:
+            host = ""
+            pid = ""
+            if isinstance(item, dict):
+                host = (
+                    item.get("address")
+                    or item.get("host")
+                    or item.get("ip")
+                    or item.get("url")
+                    or item.get("printer_url")
+                    or ""
+                )
+                pid = (
+                    item.get("id")
+                    or item.get("name")
+                    or item.get("label")
+                    or ""
+                )
+            elif isinstance(item, str):
+                host = item
+            host = _normalize_printer_host(str(host))
+            if not host:
+                continue
+            pid = _normalize_printer_id(str(pid), host)
+            printers.append({"id": pid, "address": host})
+            printer_urls.append(host)
+
+    # Also promote plain printer_urls into printers (id defaults to address)
+    existing_addrs = {str(p.get("address") or "").strip() for p in printers}
+    for host in printer_urls:
+        if host in existing_addrs:
+            continue
+        pid = _normalize_printer_id("", host)
+        printers.append({"id": pid, "address": host})
+
+    # Dedupe by id (keep first)
+    seen_ids = set()
+    printers_out: List[dict] = []
+    for p in printers:
+        pid = str(p.get("id") or "").strip()
+        addr = str(p.get("address") or "").strip()
+        if not pid or not addr or pid in seen_ids:
+            continue
+        seen_ids.add(pid)
+        printers_out.append({"id": pid, "address": addr})
+
+    cfg["printers"] = printers_out
     cfg["printer_urls"] = _dedupe_printers(printer_urls)
     cfg.setdefault("filament_diameter_mm", 1.75)
     cfg.setdefault("spoolman_url", "")
@@ -288,9 +366,9 @@ def _migrate_app_state_dict(data: dict) -> dict:
 
 def _default_printer_id() -> str:
     cfg = load_config()
-    ids = cfg.get("printer_urls") or []
-    if ids:
-        return str(ids[0])
+    printers = cfg.get("printers") or []
+    if printers:
+        return str((printers[0] or {}).get("id") or "")
     return "printer-1"
 
 
@@ -339,8 +417,15 @@ def load_state_all() -> MultiAppState:
         data = _migrate_multi_state_dict(data)
         result = _model_validate(MultiAppState, data)
         # Ensure configured printers exist in state
-        cfg_ids = load_config().get("printer_urls") or []
-        for pid in cfg_ids:
+        cfg_printers = load_config().get("printers") or []
+        for p in cfg_printers:
+            pid = str((p or {}).get("id") or "")
+            if not pid:
+                continue
+            # If state is keyed by address but config now uses a custom id, migrate it.
+            addr = str((p or {}).get("address") or "")
+            if pid not in result.printers and addr in result.printers and addr != pid:
+                result.printers[pid] = result.printers.pop(addr)
             if pid not in result.printers:
                 result.printers[pid] = default_state()
         _state_load_failed = False
@@ -360,7 +445,8 @@ def save_state_all(state: MultiAppState) -> None:
 
 
 def _all_printer_ids() -> List[str]:
-    cfg_ids = [str(x) for x in (load_config().get("printer_urls") or [])]
+    cfg_printers = load_config().get("printers") or []
+    cfg_ids = [str((p or {}).get("id") or "") for p in cfg_printers if (p or {}).get("id")]
     st = load_state_all()
     state_ids = [str(x) for x in st.printers.keys()]
     merged: List[str] = []
@@ -371,14 +457,40 @@ def _all_printer_ids() -> List[str]:
 
 
 def _resolve_printer_id(printer_id: Optional[str], *, allow_unknown: bool = False) -> str:
-    pid = _normalize_printer_host(printer_id or "")
+    raw = (printer_id or "").strip()
+    cfg_ids = {str((p or {}).get("id") or "").strip() for p in (load_config().get("printers") or [])}
+    if raw and raw in cfg_ids:
+        pid = raw
+    else:
+        pid = _normalize_printer_host(raw)
     if not pid:
         pid = _default_printer_id()
+    else:
+        # If caller passed an address, map it to configured id if present
+        for p in (load_config().get("printers") or []):
+            addr = str((p or {}).get("address") or "").strip()
+            cid = str((p or {}).get("id") or "").strip()
+            if addr and cid and pid == addr:
+                pid = cid
+                break
     if not allow_unknown:
         known = set(_all_printer_ids())
         if pid not in known:
             raise HTTPException(status_code=404, detail="Unknown printer")
     return pid
+
+
+def _printer_address(printer_id: str) -> str:
+    pid = (printer_id or "").strip()
+    if not pid:
+        return ""
+    for p in (load_config().get("printers") or []):
+        cid = str((p or {}).get("id") or "").strip()
+        addr = str((p or {}).get("address") or "").strip()
+        if cid and addr and cid == pid:
+            return addr
+    # Fallback: treat printer_id as host/IP
+    return _normalize_printer_host(pid)
 
 
 def load_state(printer_id: Optional[str] = None) -> AppState:
@@ -568,7 +680,7 @@ def _spoolman_autolink_by_rfid(slot: str, rfid: str, st, printer_id: str) -> Non
 
 async def _fetch_printer_material_json(printer_id: str) -> Optional[dict]:
     """SFTP-fetch material_box_info.json from the printer (runs in thread executor)."""
-    host = (printer_id or "").strip().split(":")[0]
+    host = (_printer_address(printer_id) or "").strip().split(":")[0]
     if not host:
         return None
 
@@ -701,7 +813,7 @@ _WS_FW_KEYS   = ("softVersion", "firmwareVersion", "version", "FirmwareVersion",
 
 
 def _printer_ws_url(printer_id: str) -> str:
-    host = (printer_id or "").strip()
+    host = _printer_address(printer_id)
     if not host:
         return ""
     return f"ws://{host.split(':')[0]}:9999"
@@ -715,10 +827,10 @@ def _moonraker_base_url(printer_id: str) -> str:
         parsed = urlparse(mu)
         host = parsed.hostname or ""
         port = parsed.port or 7125
-        cfg_ids = cfg.get("printer_urls") or []
-        if len(cfg_ids) <= 1 or host == printer_id:
+        cfg_ids = [str((p or {}).get("id") or "") for p in (cfg.get("printers") or [])]
+        if len(cfg_ids) <= 1 or host == _printer_address(printer_id):
             return f"http://{host}:{port}"
-    host = (printer_id or "").strip().split(":")[0]
+    host = (_printer_address(printer_id) or "").split(":")[0]
     return f"http://{host}:7125" if host else ""
 
 
@@ -1211,7 +1323,7 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 @app.on_event("startup")
 async def _startup():
     _ensure_data_files()
-    printer_ids = load_config().get("printer_urls") or []
+    printer_ids = [str((p or {}).get("id") or "") for p in (load_config().get("printers") or []) if (p or {}).get("id")]
     if not printer_ids:
         print("[BOOT] No printers configured — waiting for data/config.json")
     for pid in printer_ids:
@@ -1284,6 +1396,7 @@ def api_printers():
         st = load_state(pid)
         printers.append({
             "id": pid,
+            "address": _printer_address(pid),
             "name": st.printer_name,
             "firmware": st.printer_firmware,
             "connected": st.printer_connected,
@@ -1594,13 +1707,13 @@ def api_ui_help(lang: str = "de") -> ApiResponse:
     if lang == "en":
         text = (
             "Click a slot to set it as active.\n"
-            "Set printer_urls in data/config.json to your printer IPs to enable live CFS slot sync via WebSocket.\n"
+            "Set printer_urls (or printers) in data/config.json to your printer IPs to enable live CFS slot sync via WebSocket.\n"
             "Link a Spoolman spool to a slot to track filament consumption automatically."
         )
     else:
         text = (
             "Klick einen Slot, um ihn aktiv zu setzen.\n"
-            "Trage printer_urls in data/config.json mit den IPs deiner Drucker ein, um die CFS-Slots per WebSocket zu synchronisieren.\n"
+            "Trage printer_urls (oder printers) in data/config.json mit den IPs deiner Drucker ein, um die CFS-Slots per WebSocket zu synchronisieren.\n"
             "Verknüpfe einen Spoolman-Spool mit einem Slot, um den Filamentverbrauch automatisch zu verfolgen."
         )
     return ApiResponse(result={"text": text})
@@ -1643,6 +1756,8 @@ def default_state() -> AppState:
 
 def default_multi_state() -> MultiAppState:
     printers: Dict[str, AppState] = {}
-    for pid in load_config().get("printer_urls") or []:
-        printers[str(pid)] = default_state()
+    for p in load_config().get("printers") or []:
+        pid = str((p or {}).get("id") or "")
+        if pid:
+            printers[pid] = default_state()
     return MultiAppState(printers=printers, updated_at=_now())
