@@ -18,7 +18,7 @@ function badge(el, text, cls) {
   el.textContent = text;
 }
 
-function slotEl(slotId, label, meta, isActive) {
+function slotEl(slotId, label, meta, isActive, printerId) {
   const wrap = document.createElement("div");
   wrap.className = "slot" + (isActive ? " active" : "");
   wrap.dataset.slotid = slotId;
@@ -85,7 +85,7 @@ function slotEl(slotId, label, meta, isActive) {
 
   wrap.addEventListener("click", (ev) => {
     ev.preventDefault();
-    openSpoolModal(slotId, meta);
+    openSpoolModal(slotId, meta, printerId);
   });
   return wrap;
 }
@@ -132,12 +132,14 @@ let spoolmanConfigured = false;
 let spoolModalOpen = false;
 let spoolPrevPaused = null;
 let spoolSlotId = null;
+let spoolPrinterId = null;
 
 function closeSpoolModal() {
   const m = $('spoolModal');
   if (m) m.style.display = 'none';
   spoolModalOpen = false;
   spoolSlotId = null;
+  spoolPrinterId = null;
   if (spoolPrevPaused !== null) {
     refreshPaused = spoolPrevPaused;
     spoolPrevPaused = null;
@@ -145,12 +147,13 @@ function closeSpoolModal() {
   }
 }
 
-function openSpoolModal(slotId, meta) {
+function openSpoolModal(slotId, meta, printerId) {
   // Only open if modal exists (older builds)
   const m = $('spoolModal');
   if (!m) return;
   spoolModalOpen = true;
   spoolSlotId = slotId;
+  spoolPrinterId = printerId || null;
 
   // Pause auto-refresh while editing so nothing collapses
   if (spoolPrevPaused === null) spoolPrevPaused = refreshPaused;
@@ -183,7 +186,7 @@ function openSpoolModal(slotId, meta) {
         if (info) {
           info.textContent = 'Loading spool data…';
           // Fetch live remaining from Spoolman
-          fetch(`/api/ui/spoolman/spool_detail?slot=${encodeURIComponent(slotId)}`, { cache: 'no-store' })
+          fetch(`/api/ui/spoolman/spool_detail?slot=${encodeURIComponent(slotId)}&printer_id=${encodeURIComponent(printerId || '')}`, { cache: 'no-store' })
             .then(r => r.json())
             .then(data => {
               if (data.spool) {
@@ -205,7 +208,7 @@ function openSpoolModal(slotId, meta) {
         if (bdg) { bdg.textContent = 'not linked'; bdg.classList.add('muted'); bdg.classList.remove('ok'); }
         if (notLinked) notLinked.style.display = 'flex';
         if (linked) linked.style.display = 'none';
-        loadSpoolmanDropdown(slotId);
+        loadSpoolmanDropdown(slotId, printerId);
       }
     } else {
       smSec.style.display = 'none';
@@ -215,7 +218,7 @@ function openSpoolModal(slotId, meta) {
   m.style.display = 'block';
 }
 
-async function loadSpoolmanDropdown(slotId) {
+async function loadSpoolmanDropdown(slotId, printerId) {
   const list = $('spoolmanSelect');
   if (!list) return;
   list.innerHTML = '';
@@ -225,7 +228,7 @@ async function loadSpoolmanDropdown(slotId) {
   list.appendChild(ph);
 
   try {
-    const r = await fetch(`/api/ui/spoolman/spools?slot=${encodeURIComponent(slotId)}`, { cache: 'no-store' });
+    const r = await fetch(`/api/ui/spoolman/spools?slot=${encodeURIComponent(slotId)}&printer_id=${encodeURIComponent(printerId || '')}`, { cache: 'no-store' });
     if (!r.ok) throw new Error(await r.text());
     const data = await r.json();
     const spools = data.spools || [];
@@ -301,9 +304,9 @@ function initSpoolModal() {
     saveStart.onclick = async (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
-      if (!spoolSlotId) return;
+      if (!spoolSlotId || !spoolPrinterId) return;
       // Rollwechsel: new epoch + auto-unlink Spoolman
-      await postJson('/api/ui/spool/set_start', { slot: spoolSlotId });
+      await postJson('/api/ui/spool/set_start', { printer_id: spoolPrinterId, slot: spoolSlotId });
       closeSpoolModal();
       await tick();
     };
@@ -318,12 +321,12 @@ function initSpoolModal() {
     smLink.onclick = async (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
-      if (!spoolSlotId) return;
+      if (!spoolSlotId || !spoolPrinterId) return;
       const list = $('spoolmanSelect');
       const selected = list && list.querySelector('.spoolmanListItem.selected');
       const id = selected ? Number(selected.dataset.id) : 0;
       if (!id) return;
-      await postJson('/api/ui/spoolman/link', { slot: spoolSlotId, spoolman_id: id });
+      await postJson('/api/ui/spoolman/link', { printer_id: spoolPrinterId, slot: spoolSlotId, spoolman_id: id });
       closeSpoolModal();
       await tick();
     };
@@ -333,8 +336,8 @@ function initSpoolModal() {
     smUnlink.onclick = async (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
-      if (!spoolSlotId) return;
-      await postJson('/api/ui/spoolman/unlink', { slot: spoolSlotId });
+      if (!spoolSlotId || !spoolPrinterId) return;
+      await postJson('/api/ui/spoolman/unlink', { printer_id: spoolPrinterId, slot: spoolSlotId });
       closeSpoolModal();
       await tick();
     };
@@ -344,12 +347,12 @@ function initSpoolModal() {
     smRefresh.onclick = async (ev) => {
       ev.preventDefault();
       ev.stopPropagation();
-      if (!spoolSlotId) return;
+      if (!spoolSlotId || !spoolPrinterId) return;
       // Re-fetch spool detail from Spoolman
       const info = $('spoolmanInfo');
       try {
         if (info) info.textContent = 'Loading spool data…';
-        const r = await fetch(`/api/ui/spoolman/spool_detail?slot=${encodeURIComponent(spoolSlotId)}`, { cache: 'no-store' });
+        const r = await fetch(`/api/ui/spoolman/spool_detail?slot=${encodeURIComponent(spoolSlotId)}&printer_id=${encodeURIComponent(spoolPrinterId)}`, { cache: 'no-store' });
         const data = await r.json();
         if (data.spool) {
           const fil = data.spool.filament || {};
@@ -379,8 +382,7 @@ function fmtRelative(ts) {
   return Math.floor(secs / (86400 * 30)) + 'mo ago';
 }
 
-function renderCfsStats(state) {
-  const wrap = $("slotHistory");
+function renderCfsStats(state, wrap) {
   if (!wrap) return;
   wrap.innerHTML = '';
 
@@ -491,53 +493,107 @@ function makeSpoolSvg(meta) {
   </svg>`;
 }
 
-function render(state) {
-  // Spoolman external link
-  const smExtLink = $("spoolmanExtLink");
-  if (smExtLink) {
-    if (state.spoolman_url) {
-      smExtLink.href = state.spoolman_url;
-      smExtLink.style.display = '';
-    } else {
-      smExtLink.style.display = 'none';
-    }
-  }
+function renderPrinter(printerId, state) {
+  const block = document.createElement("section");
+  block.className = "printerBlock";
+  if (printerId) block.dataset.printerId = printerId;
 
-  // Update heading, tab title and subtitle with printer identity from WS
-  const printerTitle = $("printerTitle");
-  if (printerTitle && state.printer_name) {
-    printerTitle.textContent = state.printer_name;
-    document.title = state.printer_name;
-  }
-  const sub = $("printerSubtitle");
-  if (sub) {
-    const parts = [state.printer_firmware].filter(Boolean);
-    sub.textContent = parts.length ? parts.join(" · ") : "";
-  }
+  const head = document.createElement("div");
+  head.className = "printerHead";
 
-  const printerBadge = $("printerBadge");
-  const cfsBadge = $("cfsBadge");
+  const titleWrap = document.createElement("div");
+  titleWrap.className = "printerTitleWrap";
+  const nameEl = document.createElement("div");
+  nameEl.className = "printerName";
+  nameEl.textContent = state.printer_name || printerId || "Printer";
+  const metaEl = document.createElement("div");
+  metaEl.className = "printerMeta";
+  metaEl.textContent = [printerId, state.printer_firmware].filter(Boolean).join(" · ");
+  titleWrap.appendChild(nameEl);
+  titleWrap.appendChild(metaEl);
+  head.appendChild(titleWrap);
 
+  const badges = document.createElement("div");
+  badges.className = "printerBadges";
+  const pBadge = document.createElement("div");
+  pBadge.className = "badge";
+  const cfsBadge = document.createElement("div");
+  cfsBadge.className = "badge";
   const printerOk = !!state.printer_connected;
-  badge(printerBadge, printerOk ? 'Printer: connected' : 'Printer: disconnected', printerOk ? "ok" : "bad");
+  badge(pBadge, printerOk ? "Printer: connected" : "Printer: disconnected", printerOk ? "ok" : "bad");
   if (!printerOk && state.printer_last_error) {
-    printerBadge.textContent += " (" + state.printer_last_error + ")";
+    pBadge.textContent += " (" + state.printer_last_error + ")";
   }
-
   const cfsOk = !!state.cfs_connected;
   badge(
     cfsBadge,
-    cfsOk ? `CFS: detected · ${fmtTs(state.cfs_last_update)}` : 'CFS: —',
+    cfsOk ? `CFS: detected · ${fmtTs(state.cfs_last_update)}` : "CFS: —",
     cfsOk ? "ok" : "warn"
   );
+  badges.appendChild(pBadge);
+  badges.appendChild(cfsBadge);
+  head.appendChild(badges);
+  block.appendChild(head);
+
+  const layout = document.createElement("div");
+  layout.className = "layout";
+
+  const leftCol = document.createElement("div");
+  leftCol.className = "leftCol";
+  const boxesGrid = document.createElement("section");
+  boxesGrid.className = "grid";
+  leftCol.appendChild(boxesGrid);
+
+  const activeCard = document.createElement("section");
+  activeCard.className = "card";
+  activeCard.style.marginTop = "16px";
+  const activeHead = document.createElement("div");
+  activeHead.className = "cardHead";
+  const activeTitle = document.createElement("div");
+  activeTitle.className = "cardTitle";
+  activeTitle.textContent = "Active";
+  const activeMeta = document.createElement("div");
+  activeMeta.className = "cardMeta";
+  activeMeta.textContent = "—";
+  activeHead.appendChild(activeTitle);
+  activeHead.appendChild(activeMeta);
+  activeCard.appendChild(activeHead);
+  const activeRow = document.createElement("div");
+  activeRow.className = "activeRow";
+  activeCard.appendChild(activeRow);
+  const activeLive = document.createElement("div");
+  activeLive.className = "activeLive";
+  activeLive.style.display = "none";
+  activeCard.appendChild(activeLive);
+  leftCol.appendChild(activeCard);
+
+  const rightCol = document.createElement("aside");
+  rightCol.className = "rightCol";
+  const statsCard = document.createElement("section");
+  statsCard.className = "card";
+  const statsHead = document.createElement("div");
+  statsHead.className = "cardHead";
+  const statsTitle = document.createElement("div");
+  statsTitle.className = "cardTitle";
+  statsTitle.textContent = "CFS Stats";
+  const statsMeta = document.createElement("div");
+  statsMeta.className = "cardMeta";
+  statsHead.appendChild(statsTitle);
+  statsHead.appendChild(statsMeta);
+  statsCard.appendChild(statsHead);
+  const history = document.createElement("div");
+  history.className = "history";
+  statsCard.appendChild(history);
+  rightCol.appendChild(statsCard);
+
+  layout.appendChild(leftCol);
+  layout.appendChild(rightCol);
+  block.appendChild(layout);
 
   // We prefer Creality CFS slots (state.cfs_slots). Fallback to local slots if not present.
-  const slots = (state.cfs_slots && Object.keys(state.cfs_slots).length) ? state.cfs_slots : state.slots;
-
+  const localSlots = state.slots || {};
+  const slots = (state.cfs_slots && Object.keys(state.cfs_slots).length) ? state.cfs_slots : localSlots;
   const active = state.cfs_active_slot || null;
-
-  const boxesGrid = $("boxesGrid");
-  boxesGrid.innerHTML = "";
 
   // Determine which CFS boxes are actually connected.
   const boxesInfo = (slots && slots._boxes) ? slots._boxes : {};
@@ -554,7 +610,7 @@ function render(state) {
     // BUT spool tracking (remaining/consumed + reference points) lives in state.slots.
     // Therefore we must merge both.
     const m = (slots && slots[sid]) ? slots[sid] : {};
-    const local = (state.slots && state.slots[sid]) ? state.slots[sid] : {};
+    const local = (localSlots && localSlots[sid]) ? localSlots[sid] : {};
 
     // normalize fields from either cfs_slots or local slots
     const out = {
@@ -653,7 +709,7 @@ function render(state) {
 
       pod.addEventListener("click", (ev) => {
         ev.preventDefault();
-        openSpoolModal(sid, m);
+        openSpoolModal(sid, m, printerId);
       });
 
       slotsWrap.appendChild(pod);
@@ -668,22 +724,80 @@ function render(state) {
   }
 
   // Right-side CFS stats panel
-  renderCfsStats(state);
+  renderCfsStats(state, history);
 
   // Active card
-  const activeRow = $("activeRow");
-  activeRow.innerHTML = "";
-  const activeLive = $("activeLive");
-  if (activeLive) {
-    activeLive.style.display = "none";
-    activeLive.innerHTML = "";
-  }
-  if (active && (slots[active] || state.slots[active])) {
+  if (active && (slots[active] || localSlots[active])) {
     const m = metaFor(active);
-    activeRow.appendChild(slotEl(active, `Box ${active[0]} · Slot ${active[1]}`, m, true));
-    $("activeMeta").textContent = m.material ? (m.material + " · " + (m.color ? m.color.toUpperCase() : "")) : "—";
+    activeRow.appendChild(slotEl(active, `Box ${active[0]} · Slot ${active[1]}`, m, true, printerId));
+    activeMeta.textContent = m.material ? (m.material + " · " + (m.color ? m.color.toUpperCase() : "")) : "—";
   } else {
-    $("activeMeta").textContent = "—";
+    activeMeta.textContent = "—";
+  }
+
+  return block;
+}
+
+function render(ui) {
+  const printers = (ui && ui.printers) ? ui.printers : [];
+
+  // Spoolman external link
+  const smExtLink = $("spoolmanExtLink");
+  if (smExtLink) {
+    if (ui && ui.spoolman_url) {
+      smExtLink.href = ui.spoolman_url;
+      smExtLink.style.display = '';
+    } else {
+      smExtLink.style.display = 'none';
+    }
+  }
+
+  // Update heading / title
+  const printerTitle = $("printerTitle");
+  if (printerTitle) printerTitle.textContent = "CFSync";
+  document.title = printers.length ? `CFSync · ${printers.length} printers` : "CFSync";
+  const sub = $("printerSubtitle");
+  if (sub) {
+    sub.textContent = printers.length ? `${printers.length} printer${printers.length === 1 ? "" : "s"} configured` : "No printers configured";
+  }
+
+  const printerBadge = $("printerBadge");
+  const cfsBadge = $("cfsBadge");
+  const total = printers.length;
+  const connected = printers.filter(p => (p.state || p).printer_connected).length;
+  const cfsOk = printers.filter(p => (p.state || p).cfs_connected).length;
+
+  if (printerBadge) {
+    if (!total) {
+      badge(printerBadge, "Printers: —", "warn");
+    } else {
+      const cls = connected === total ? "ok" : (connected > 0 ? "warn" : "bad");
+      badge(printerBadge, `Printers: ${connected}/${total} online`, cls);
+    }
+  }
+  if (cfsBadge) {
+    if (!total) {
+      badge(cfsBadge, "CFS: —", "warn");
+    } else {
+      badge(cfsBadge, `CFS: ${cfsOk}/${total} detected`, cfsOk > 0 ? "ok" : "warn");
+    }
+  }
+
+  const wrap = $("printersWrap");
+  if (!wrap) return;
+  wrap.innerHTML = "";
+  if (!printers.length) {
+    const empty = document.createElement("div");
+    empty.className = "emptyState";
+    empty.textContent = "No printers configured. Set printer_urls in data/config.json and reload.";
+    wrap.appendChild(empty);
+    return;
+  }
+
+  for (const p of printers) {
+    const pid = p.id || p.printer_id || p.host || "";
+    const st = p.state || p;
+    wrap.appendChild(renderPrinter(pid, st));
   }
 }
 
@@ -695,8 +809,10 @@ async function tick() {
     spoolmanConfigured = !!st.spoolman_configured;
     render(st);
   } catch (e) {
-    badge($("printerBadge"), 'Printer: —', "warn");
-    badge($("cfsBadge"), 'CFS: —', "warn");
+    const pb = $("printerBadge");
+    const cb = $("cfsBadge");
+    if (pb) badge(pb, 'Printers: —', "warn");
+    if (cb) badge(cb, 'CFS: —', "warn");
   }
 }
 

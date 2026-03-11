@@ -31,7 +31,7 @@ The installer will prompt for:
 | Prompt | Example |
 |---|---|
 | UI port | `8005` |
-| Printer IP | `192.168.1.144` |
+| Printer IPs | `192.168.1.144, 192.168.1.145` |
 | Spoolman URL *(optional)* | `http://192.168.1.10:7912` |
 
 After install, open `http://<host-ip>:<port>` in your browser.
@@ -42,7 +42,7 @@ Settings are stored in `data/config.json`:
 
 ```json
 {
-  "printer_url": "192.168.1.144",
+  "printer_urls": ["192.168.1.144", "192.168.1.145"],
   "filament_diameter_mm": 1.75,
   "spoolman_url": "http://192.168.1.10:7912"
 }

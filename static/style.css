@@ -34,6 +34,18 @@ body{
   z-index:10;
 }
 
+.topbarRight{display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:flex-end}
+.spoolmanLink{
+  font-size:12px;
+  color:var(--muted);
+  text-decoration:none;
+  padding:6px 10px;
+  border-radius:999px;
+  border:1px solid rgba(29,42,58,.8);
+  background:rgba(15,34,54,.45);
+}
+.spoolmanLink:hover{color:var(--text);border-color:rgba(255,255,255,.2)}
+
 .brand{display:flex;gap:12px;align-items:center}
 .logoWrap{width:38px;height:38px;overflow:hidden;flex-shrink:0}
 .logoImg{
@@ -62,6 +74,28 @@ body{
 .badge.warn{border-color: rgba(246,183,60,.45);}
 
 .container{max-width:1400px;margin:0 auto;padding:18px}
+
+.printersWrap{display:flex;flex-direction:column;gap:16px}
+.printerBlock{
+  border:1px solid var(--line);
+  background: linear-gradient(180deg, rgba(17,24,36,.85), rgba(11,15,20,.85));
+  border-radius:24px;
+  padding:14px;
+  box-shadow: 0 12px 28px rgba(0,0,0,.28);
+}
+.printerHead{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.printerTitleWrap{display:flex;flex-direction:column;gap:2px;min-width:0}
+.printerName{font-size:16px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.printerMeta{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.printerBadges{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}
+.emptyState{
+  border:1px dashed rgba(255,255,255,.12);
+  border-radius:18px;
+  padding:14px 16px;
+  color:var(--muted);
+  font-size:13px;
+  text-align:center;
+}
 
 .layout{
   display:grid;
@@ -361,4 +395,3 @@ code{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospa
 .spoolmanListSwatch{width:13px;height:13px;border-radius:3px;flex-shrink:0;border:1px solid rgba(255,255,255,.18)}
 .spoolmanInfo{font-size:13px;color:var(--muted);flex:1}
 .spoolmanActions{display:flex;gap:8px}
-

@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_DIR="/opt/filament-management"
 SERVICE_NAME="filament-management"
-REPO_URL="https://github.com/koen01/CFSync.git"
+REPO_URL="https://github.com/davidkinnes/CFSync.git"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "Please run with sudo"
@@ -31,9 +31,16 @@ ask() {
 echo "=== CFSync Installer ==="
 
 UI_PORT=$(ask "UI Port" "8005")
-PRINTER_IP=$(ask "Printer IP" "192.168.1.144")
+PRINTER_IPS=$(ask "Printer IPs (comma-separated)" "192.168.1.144")
 DIAM=$(ask "Filament diameter (mm)" "1.75")
 SPOOLMAN_URL=$(ask "Spoolman URL (optional, e.g. http://host:7912)" "")
+
+PRINTER_JSON=$(echo "$PRINTER_IPS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | awk '{printf "\"%s\",", $0}' | sed 's/,$//')
+if [ -n "$PRINTER_JSON" ]; then
+  PRINTER_JSON="[$PRINTER_JSON]"
+else
+  PRINTER_JSON="[]"
+fi
 
 echo "Installing to $APP_DIR"
 
@@ -68,7 +75,7 @@ mkdir -p "$APP_DIR/data"
 
 cat > "$APP_DIR/data/config.json" <<CFG
 {
-  "printer_url": "${PRINTER_IP}",
+  "printer_urls": ${PRINTER_JSON},
   "filament_diameter_mm": ${DIAM},
   "spoolman_url": "${SPOOLMAN_URL}"
 }

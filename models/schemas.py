@@ -102,6 +102,7 @@ class AppState(BaseModel):
 
 
 class UpdateSlotRequest(BaseModel):
+    printer_id: Optional[str] = None
     material: Optional[MaterialType] = None
     color_hex: Optional[str] = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
     name: Optional[str] = None
@@ -109,10 +110,12 @@ class UpdateSlotRequest(BaseModel):
 
 
 class SelectSlotRequest(BaseModel):
+    printer_id: Optional[str] = None
     slot: SlotId
 
 
 class SetAutoRequest(BaseModel):
+    printer_id: Optional[str] = None
     enabled: bool
 
 
@@ -132,11 +135,13 @@ class ApiResponse(BaseModel):
 
 
 class UiSetColorRequest(BaseModel):
+    printer_id: Optional[str] = None
     slot: SlotId
     color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
 
 
 class UiSlotUpdateRequest(BaseModel):
+    printer_id: Optional[str] = None
     slot: SlotId
     material: Optional[MaterialType] = None
     color: Optional[str] = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
@@ -145,14 +150,22 @@ class UiSlotUpdateRequest(BaseModel):
 
 
 class UiSpoolSetStartRequest(BaseModel):
+    printer_id: Optional[str] = None
     slot: SlotId
     start_g: Optional[float] = None  # accepted for backward compat, not stored locally
 
 
 class SpoolmanLinkRequest(BaseModel):
+    printer_id: Optional[str] = None
     slot: SlotId
     spoolman_id: int = Field(gt=0)
 
 
 class SpoolmanUnlinkRequest(BaseModel):
+    printer_id: Optional[str] = None
     slot: SlotId
+
+
+class MultiAppState(BaseModel):
+    printers: Dict[str, AppState]
+    updated_at: float = Field(default_factory=lambda: time.time())
