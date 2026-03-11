@@ -454,6 +454,103 @@ def _spoolman_autolink_by_rfid(slot: str, rfid: str, st) -> None:
         print(f"[SPOOLMAN] auto-link lookup failed for slot {slot}: {e}")
 
 
+async def _fetch_printer_material_json() -> Optional[dict]:
+    """Fetch material_box_info.json from the printer via SSH (system ssh binary)."""
+    cfg = load_config()
+    host = (cfg.get("printer_url") or "").strip().split(":")[0]
+    if not host:
+        return None
+
+    def _ssh_cat() -> Optional[dict]:
+        import subprocess
+        try:
+            result = subprocess.run(
+                [
+                    "sshpass", "-p", "creality_2023",
+                    "ssh",
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "ConnectTimeout=5",
+                    f"root@{host}",
+                    "cat /usr/data/creality/userdata/box/material_box_info.json",
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return json.loads(result.stdout)
+            print(f"[SSH] fetch failed ({host}): {result.stderr.strip() or 'no output'}")
+            return None
+        except FileNotFoundError:
+            print("[SSH] sshpass not found; run: apt install sshpass")
+            return None
+        except Exception as e:
+            print(f"[SSH] fetch failed ({host}): {e}")
+            return None
+
+    return await asyncio.get_event_loop().run_in_executor(None, _ssh_cat)
+
+
+async def _ssh_fetch_and_apply() -> None:
+    """Fetch material_box_info.json via SSH and apply serialNum-based auto-links."""
+    global _ssh_last_fetch
+    _ssh_last_fetch = time.time()
+    info = await _fetch_printer_material_json()
+    if not info:
+        return
+
+    base = _spoolman_base_url()
+    st = load_state()
+    changed = False
+
+    for box in (info.get("Material", {}).get("info") or []):
+        box_id_str = box.get("boxID", "")   # "T1" .. "T4"
+        if not box_id_str.startswith("T"):
+            continue
+        box_num = box_id_str[1:]
+
+        for mat in (box.get("list") or []):
+            mat_id = mat.get("materialId", "")   # "A" .. "D"
+            slot = f"{box_num}{mat_id}"
+            if slot not in _VALID_SLOT_IDS:
+                continue
+
+            serial = (mat.get("serialNum") or "").strip()
+            if not serial or serial == "000000":
+                continue
+            try:
+                spool_id = int(serial)
+            except ValueError:
+                continue
+            if spool_id <= 0:
+                continue
+
+            slot_obj = st.slots.get(slot)
+            if slot_obj and getattr(slot_obj, "spoolman_id", None) == spool_id:
+                continue  # already linked
+
+            if base:
+                try:
+                    spool = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda sid=spool_id: _http_get_json(f"{base}/api/v1/spool/{sid}", timeout=5.0)
+                    )
+                    if not isinstance(spool, dict) or not spool.get("id"):
+                        print(f"[SSH] Slot {slot}: serialNum {serial!r} → spool {spool_id} not in Spoolman")
+                        continue
+                except Exception as e:
+                    print(f"[SSH] Slot {slot}: Spoolman lookup failed for spool {spool_id}: {e}")
+                    continue
+
+            if slot_obj is None:
+                slot_obj = SlotState(slot=slot)
+            slot_obj.spoolman_id = spool_id
+            st.slots[slot] = slot_obj
+            changed = True
+            print(f"[SSH] Slot {slot}: linked → Spoolman spool {spool_id} via serialNum {serial!r}")
+
+    if changed:
+        save_state(st)
+
+
 async def _ws_autolink_by_serialnum(slot: str, serial: str) -> None:
     """Link slot to Spoolman spool by serialNum extracted from WS boxsInfo data."""
     base = _spoolman_base_url()
@@ -510,6 +607,9 @@ _ws_last_rfid: Dict[str, str] = {}   # slot → last seen RFID code
 _ws_last_state: Dict[str, int] = {}  # slot → last seen CFS state (0/1/2)
 
 _ws_last_serial: Dict[str, str] = {}  # slot → last seen serialNum from WS
+
+_SSH_FETCH_COOLDOWN = 30.0  # seconds between SSH fetches of material_box_info.json
+_ssh_last_fetch: float = 0.0
 
 _moon_last_state: str = ""        # last known print_stats.state from Moonraker
 _moon_last_filament_mm: float = 0.0                   # filament_used at last poll tick
@@ -624,7 +724,7 @@ def _parse_ws_printer_info(payload: dict) -> None:
 
 def _parse_ws_cfs_data(payload: dict) -> None:
     """Parse a boxsInfo WS payload and update local state + Spoolman."""
-    global _ws_last_save, _ws_last_rfid, _ws_last_state, _ws_last_serial
+    global _ws_last_save, _ws_last_rfid, _ws_last_state, _ws_last_serial, _ssh_last_fetch
     try:
         boxes = (payload.get("boxsInfo") or {}).get("materialBoxs") or []
     except Exception:
@@ -719,7 +819,7 @@ def _parse_ws_cfs_data(payload: dict) -> None:
                     _spoolman_pct_refresh_at.pop(slot, None)
                     print(f"[CFS] Slot {slot}: state {prev_state}→{state_val}, unlinked Spoolman spool (spool swap)")
 
-            # serialNum-based auto-link directly from WS data (no SSH needed)
+            # serialNum from WS (if present) — try direct link; fall back to SSH fetch
             serial = (mat.get("serialNum") or "").strip()
             if serial and serial != "000000" and state_val == 2:
                 if serial != _ws_last_serial.get(slot, ""):
@@ -727,6 +827,11 @@ def _parse_ws_cfs_data(payload: dict) -> None:
                     slot_obj_s = st.slots.get(slot)
                     if not (slot_obj_s and getattr(slot_obj_s, "spoolman_id", None)):
                         asyncio.create_task(_ws_autolink_by_serialnum(slot, serial))
+            elif state_val == 2 and prev_state != 2:
+                # WS didn't include serialNum — trigger SSH fetch to get it
+                now = time.time()
+                if now - _ssh_last_fetch > _SSH_FETCH_COOLDOWN:
+                    asyncio.create_task(_ssh_fetch_and_apply())
 
             # RFID-based auto-link: react to any RFID change on this slot
             rfid = mat.get("rfid", "")
