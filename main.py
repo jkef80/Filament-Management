@@ -468,15 +468,23 @@ async def _fetch_printer_material_json() -> Optional[dict]:
             print("[SSH] paramiko not installed; run: pip install paramiko")
             return None
         try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(host, username="root", password="creality_2023", timeout=5,
-                        allow_agent=False, look_for_keys=False)
-            sftp = ssh.open_sftp()
+            import socket as _socket
+            # Creality firmware uses legacy SSH KEX; connect via Transport to override defaults
+            sock = _socket.create_connection((host, 22), timeout=5)
+            transport = paramiko.Transport(sock)
+            opts = transport.get_security_options()
+            opts.kex = (
+                "ecdh-sha2-nistp256", "ecdh-sha2-nistp384", "ecdh-sha2-nistp521",
+                "diffie-hellman-group-exchange-sha256", "diffie-hellman-group-exchange-sha1",
+                "diffie-hellman-group14-sha256", "diffie-hellman-group14-sha1",
+                "diffie-hellman-group1-sha1",
+            )
+            transport.connect(username="root", password="creality_2023")
+            sftp = paramiko.SFTPClient.from_transport(transport)
             with sftp.open("/usr/data/creality/userdata/box/material_box_info.json") as fh:
                 data = json.loads(fh.read())
             sftp.close()
-            ssh.close()
+            transport.close()
             return data
         except Exception as e:
             print(f"[SSH] fetch failed ({host}): {e}")
