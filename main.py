@@ -367,6 +367,8 @@ def _migrate_app_state_dict(data: dict) -> dict:
     data.setdefault("cfs_active_slot", None)
     data.setdefault("cfs_slots", {})
     data.setdefault("ws_slot_length_m", {})
+    data.setdefault("cfs_stats", {})
+    data.setdefault("job_history", [])
 
     # Clear the stale "2A" schema default — active_slot is now driven by WS only
     if data.get("active_slot") == "2A":
@@ -810,6 +812,8 @@ _moon_last_state: Dict[str, str] = {}        # printer_id → last known print_s
 _moon_last_filament_mm: Dict[str, float] = {}                   # printer_id → filament_used at last poll tick
 _moon_job_track_slot_g: Dict[str, Dict[str, float]] = {}         # printer_id → slot → grams
 _moon_job_track_slot_mm: Dict[str, Dict[str, float]] = {}        # printer_id → slot → mm
+_moon_job_started_at: Dict[str, float] = {}                       # printer_id → Unix timestamp
+_moon_job_name: Dict[str, str] = {}                               # printer_id → filename/job name
 
 _VALID_CFS_SLOT_IDS = frozenset(
     f"{b}{l}" for b in "1234" for l in "ABCD"
@@ -1265,16 +1269,41 @@ async def printer_ws_loop(printer_id: str) -> None:
         backoff = min(backoff * 2, 60.0)
 
 
-def _moon_flush_to_spoolman(printer_id: str, reason: str) -> None:
-    """Sync accumulated per-slot grams to Spoolman and reset job trackers."""
+def _moon_flush_to_spoolman(
+    printer_id: str,
+    reason: str,
+    *,
+    started_at: Optional[float] = None,
+    ended_at: Optional[float] = None,
+    job_name: str = "",
+) -> None:
+    """Sync accumulated per-slot grams to Spoolman, persist job stats, and reset trackers."""
     st = load_state(printer_id)
     job_g = _moon_job_track_slot_g.setdefault(printer_id, {})
     job_mm = _moon_job_track_slot_mm.setdefault(printer_id, {})
+    ended_ts = ended_at or _now()
+    started_ts = started_at or ended_ts
+    spools: List[dict] = []
+    total_grams = 0.0
+    total_meters = 0.0
+
     for slot, g in job_g.items():
         if g <= 0:
             continue
         slot_obj = st.slots.get(slot)
         spool_id = getattr(slot_obj, "spoolman_id", None) if slot_obj else None
+        meters = max(0.0, float(job_mm.get(slot, 0.0) or 0.0) / 1000.0)
+        total_grams += g
+        total_meters += meters
+        spools.append({
+            "slot": slot,
+            "spoolman_id": spool_id,
+            "material": str(getattr(slot_obj, "material", "") or ""),
+            "name": str(getattr(slot_obj, "name", "") or ""),
+            "manufacturer": str(getattr(slot_obj, "manufacturer", "") or ""),
+            "grams": round(g, 2),
+            "meters": round(meters, 4),
+        })
         if spool_id:
             _spoolman_report_usage(spool_id, g)
             print(f"[MOON] ({printer_id}) {reason}: slot {slot} → {g:.2f}g synced to Spoolman spool {spool_id}")
@@ -1293,7 +1322,20 @@ def _moon_flush_to_spoolman(printer_id: str, reason: str) -> None:
         stats.total_meters = round(stats.total_meters + job_mm.get(slot, 0.0) / 1000.0, 4)
         stats.last_used_at = now
         st.cfs_stats[slot] = stats
-    if any(g > 0 for g in job_g.values()):
+    history = st.job_history if isinstance(st.job_history, list) else []
+    history.append({
+        "printer_id": printer_id,
+        "job_name": job_name,
+        "reason": reason,
+        "started_at": started_ts,
+        "ended_at": ended_ts,
+        "spools": spools,
+        "total_grams": round(total_grams, 2),
+        "total_meters": round(total_meters, 4),
+    })
+    st.job_history = history[-10:]
+
+    if any(g > 0 for g in job_g.values()) or bool(st.job_history):
         save_state(printer_id, st)
 
     _moon_job_track_slot_g[printer_id] = {}
@@ -1320,6 +1362,7 @@ async def moonraker_job_poll_loop(printer_id: str) -> None:
             ps = (data.get("result") or {}).get("status", {}).get("print_stats") or {}
             new_state = str(ps.get("state") or "").lower()
             filament_used_mm = float(ps.get("filament_used") or 0)
+            job_name = str(ps.get("filename") or ps.get("job_name") or "").strip()
 
             prev = _moon_last_state.get(printer_id, "")
             _moon_last_state[printer_id] = new_state
@@ -1329,9 +1372,13 @@ async def moonraker_job_poll_loop(printer_id: str) -> None:
                 _moon_job_track_slot_g[printer_id] = {}
                 _moon_job_track_slot_mm[printer_id] = {}
                 _moon_last_filament_mm[printer_id] = filament_used_mm
+                _moon_job_started_at[printer_id] = _now()
+                _moon_job_name[printer_id] = job_name
                 print(f"[MOON] ({printer_id}) State: {prev!r} → {new_state!r}; tracking filament deltas per active slot")
 
             elif new_state in _ACTIVE_STATES:
+                if job_name:
+                    _moon_job_name[printer_id] = job_name
                 # Still printing/paused — attribute delta to currently active slot
                 delta_mm = max(0.0, filament_used_mm - _moon_last_filament_mm.get(printer_id, 0.0))
                 _moon_last_filament_mm[printer_id] = filament_used_mm
@@ -1362,7 +1409,15 @@ async def moonraker_job_poll_loop(printer_id: str) -> None:
                             job_g[curr_slot] = job_g.get(curr_slot, 0.0) + g
                             job_mm[curr_slot] = job_mm.get(curr_slot, 0.0) + delta_mm
                 print(f"[MOON] ({printer_id}) State: {prev!r} → {new_state!r}; {filament_used_mm:.0f}mm total filament used")
-                _moon_flush_to_spoolman(printer_id, f"Job {new_state}")
+                _moon_flush_to_spoolman(
+                    printer_id,
+                    f"Job {new_state}",
+                    started_at=_moon_job_started_at.get(printer_id),
+                    ended_at=_now(),
+                    job_name=_moon_job_name.get(printer_id, job_name),
+                )
+                _moon_job_started_at.pop(printer_id, None)
+                _moon_job_name.pop(printer_id, None)
 
         except Exception:
             # Network errors are expected when printer is off — don't log verbosely
@@ -1447,6 +1502,7 @@ def _ui_state_dict(state: AppState) -> dict:
     d.setdefault("cfs_active_slot", None)
     d.setdefault("cfs_slots", {})
     d.setdefault("cfs_stats", {})
+    d.setdefault("job_history", [])
     d["spoolman_configured"] = bool(_spoolman_base_url())
     d["spoolman_url"] = _spoolman_base_url()
 

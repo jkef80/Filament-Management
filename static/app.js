@@ -869,6 +869,101 @@ function renderPrinter(printerId, state) {
   return block;
 }
 
+function renderRecentJobsCard(printers) {
+  const rows = [];
+  for (const p of printers) {
+    const pid = p.id || p.printer_id || p.host || "";
+    const st = p.state || p;
+    const hist = Array.isArray(st.job_history) ? st.job_history : [];
+    for (const j of hist) {
+      if (!j || typeof j !== "object") continue;
+      const startedAt = Number(j.started_at || 0);
+      const endedAt = Number(j.ended_at || 0);
+      const spools = Array.isArray(j.spools) ? j.spools : [];
+      const totalMeters = Number(j.total_meters || 0);
+      const totalGrams = Number(j.total_grams || 0);
+      rows.push({
+        startedAt,
+        endedAt,
+        printer: String(j.printer_id || pid || "—"),
+        spools,
+        totalMeters,
+        totalGrams,
+      });
+    }
+  }
+
+  rows.sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0));
+  const top = rows.slice(0, 10);
+
+  const block = document.createElement("section");
+  block.className = "printerBlock";
+  const head = document.createElement("div");
+  head.className = "printerHead";
+  const titleWrap = document.createElement("div");
+  titleWrap.className = "printerTitleWrap";
+  const title = document.createElement("div");
+  title.className = "printerName";
+  title.textContent = "Recent Jobs";
+  const meta = document.createElement("div");
+  meta.className = "printerMeta";
+  meta.textContent = "Last 10 completed jobs";
+  titleWrap.appendChild(title);
+  titleWrap.appendChild(meta);
+  head.appendChild(titleWrap);
+  block.appendChild(head);
+
+  const body = document.createElement("section");
+  body.className = "card";
+  const list = document.createElement("div");
+  list.className = "moonHist";
+  body.appendChild(list);
+  block.appendChild(body);
+
+  if (!top.length) {
+    const empty = document.createElement("div");
+    empty.className = "emptyState";
+    empty.textContent = "No completed jobs yet.";
+    list.appendChild(empty);
+    return block;
+  }
+
+  for (const j of top) {
+    const entry = document.createElement("div");
+    entry.className = "moonEntry";
+
+    const row = document.createElement("div");
+    row.className = "moonRow";
+    const left = document.createElement("div");
+    left.className = "moonJob";
+    left.textContent = `Printer: ${j.printer}`;
+    const right = document.createElement("div");
+    right.className = "moonNums";
+    right.textContent = `${j.totalMeters.toFixed(1)} m · ${fmtG(j.totalGrams)}`;
+    row.appendChild(left);
+    row.appendChild(right);
+    entry.appendChild(row);
+
+    const sub = document.createElement("div");
+    sub.className = "moonSub";
+    const spoolText = j.spools.length
+      ? j.spools
+        .map((s) => {
+          const slot = s.slot || "—";
+          const sid = s.spoolman_id ? `#${s.spoolman_id}` : "";
+          return `${slot}${sid ? " " + sid : ""}`;
+        })
+        .join(", ")
+      : "—";
+    sub.textContent = `Start: ${fmtTs(j.startedAt)} · End: ${fmtTs(j.endedAt)} · Spool: ${spoolText}`;
+    entry.appendChild(sub);
+
+    list.appendChild(entry);
+  }
+
+  return block;
+}
+
 function render(ui) {
   const printers = (ui && ui.printers) ? ui.printers : [];
 
@@ -930,6 +1025,7 @@ function render(ui) {
     const st = p.state || p;
     wrap.appendChild(renderPrinter(pid, st));
   }
+  wrap.appendChild(renderRecentJobsCard(printers));
 }
 
 async function tick() {

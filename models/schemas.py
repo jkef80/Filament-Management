@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Literal, Optional, Any, Union
+from typing import Dict, Literal, Optional, Any, Union, List
 import time
 from datetime import datetime, timezone
 from pydantic import BaseModel, Field, field_validator
@@ -75,6 +75,8 @@ class AppState(BaseModel):
 
     # Lifetime wear stats per slot (cumulative meters, kg, last usage)
     cfs_stats: Dict[str, SlotStats] = Field(default_factory=dict)
+    # Recent print jobs (most recent last), max 10 entries
+    job_history: List[Dict[str, Any]] = Field(default_factory=list)
 
     # Printer identity from WS status messages
     printer_name: str = ""
