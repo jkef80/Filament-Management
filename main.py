@@ -970,17 +970,18 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
                 slot_obj.manufacturer = vendor
             st.slots[slot] = slot_obj
 
-        # Detect RFID→non-RFID swap: unlink Spoolman when state drops from 2
+        # Detect spool removal/swap and unlink Spoolman.
         prev_state = last_state.get(slot, -1)
         last_state[slot] = state_val
-        if prev_state == 2 and state_val != 2:
+        removed_or_swapped = (prev_state == 2 and state_val != 2) or (prev_state > 0 and state_val == 0)
+        if removed_or_swapped:
             slot_obj_swap = st.slots.get(slot)
             if slot_obj_swap and getattr(slot_obj_swap, "spoolman_id", None):
                 slot_obj_swap.spoolman_id = None
                 st.slots[slot] = slot_obj_swap
                 st.ws_slot_length_m.pop(slot, None)
                 last_rfid.pop(slot, None)
-                print(f"[CFS] ({printer_id}) Slot {slot}: state {prev_state}→{state_val}, unlinked Spoolman spool (spool swap)")
+                print(f"[CFS] ({printer_id}) Slot {slot}: state {prev_state}→{state_val}, unlinked Spoolman spool")
 
         # SSH serialNum-based auto-link is only available for CFS slots.
         if allow_ssh_serial_lookup and state_val == 2 and prev_state != 2:
@@ -1563,8 +1564,12 @@ def api_ui_spoolman_spools(slot: str = "1A", printer_id: Optional[str] = None):
     pid = _resolve_printer_id(printer_id, allow_unknown=printer_id is None)
     state = load_state(pid)
     s = state.slots.get(slot)
-    slot_material = (getattr(s, "material", "PLA") or "PLA").upper() if s else "PLA"
-    slot_color = (getattr(s, "color_hex", "") or "").lower() if s else ""
+    cfs_slot = state.cfs_slots.get(slot) if isinstance(state.cfs_slots, dict) else None
+    slot_present = True
+    if isinstance(cfs_slot, dict):
+        slot_present = bool(cfs_slot.get("present", True))
+    slot_material = (getattr(s, "material", "") or "").upper() if (s and slot_present) else ""
+    slot_color = (getattr(s, "color_hex", "") or "").lower() if (s and slot_present) else ""
 
     try:
         raw = _spoolman_get_spools(base)

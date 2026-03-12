@@ -47,6 +47,11 @@ function slotEl(slotId, label, meta, isActive, printerId) {
 
   const sub = document.createElement("div");
   sub.className = "slotSub";
+  if (meta.present === false) {
+    sub.textContent = "empty";
+    txt.appendChild(sub);
+    left.appendChild(txt);
+  } else {
   // Line 2: brand + filament name if available, else material + color
   const brandName = [meta.manufacturer, meta.name].filter(Boolean).join(' ');
   if (brandName) {
@@ -71,6 +76,7 @@ function slotEl(slotId, label, meta, isActive, printerId) {
   }
 
   left.appendChild(txt);
+  }
 
   const right = document.createElement("div");
   right.className = "slotRight";
@@ -169,7 +175,13 @@ function openSpoolModal(slotId, meta, printerId) {
   const title = $('spoolTitle');
   const sub = $('spoolSub');
   if (title) title.textContent = slotTitle(slotId);
-  if (sub) sub.textContent = `${meta.material || '—'} · ${(meta.color || '').toUpperCase() || '—'}`;
+  if (sub) {
+    if (meta.present === false) {
+      sub.textContent = "empty";
+    } else {
+      sub.textContent = `${meta.material || '—'} · ${(meta.color || '').toUpperCase() || '—'}`;
+    }
+  }
 
   // New roll input stays empty by default
   const startEl = $('spoolStart');
@@ -618,20 +630,21 @@ function renderPrinter(printerId, state) {
     const m = (slots && slots[sid]) ? slots[sid] : {};
     const local = (localSlots && localSlots[sid]) ? localSlots[sid] : {};
     const defaultPresent = sid === PRINTER_SPOOL_SLOT ? false : true;
+    const present = (m.present ?? local.present ?? defaultPresent);
 
     // normalize fields from either cfs_slots or local slots
     const out = {
-      present: (m.present ?? local.present ?? defaultPresent),
-      material: ((m.material ?? local.material) || "").toString().toUpperCase(),
-      color: ((m.color ?? m.color_hex ?? local.color ?? local.color_hex) || "").toString().toLowerCase(),
+      present,
+      material: present === false ? "" : ((m.material ?? local.material) || "").toString().toUpperCase(),
+      color: present === false ? "" : ((m.color ?? m.color_hex ?? local.color ?? local.color_hex) || "").toString().toLowerCase(),
 
       // spool epoch (for roll-change tracking)
       spool_epoch: (local.spool_epoch ?? null),
 
       // Spoolman
       spoolman_id: (local.spoolman_id ?? null),
-      name: (local.name ?? ''),
-      manufacturer: (local.manufacturer ?? local.vendor ?? ''),
+      name: present === false ? "" : (local.name ?? ''),
+      manufacturer: present === false ? "" : (local.manufacturer ?? local.vendor ?? ''),
 
       // CFS percent remaining from WS data
       percent: (m.percent != null ? m.percent : null),
