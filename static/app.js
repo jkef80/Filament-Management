@@ -395,6 +395,25 @@ function fmtRelative(ts) {
   return Math.floor(secs / (86400 * 30)) + 'mo ago';
 }
 
+function inferLiveCfsBoxes(cfsSlots) {
+  if (!cfsSlots || typeof cfsSlots !== "object") return [];
+  const out = new Set();
+  for (const sid of Object.keys(cfsSlots)) {
+    if (!/^[1-4][A-D]$/.test(sid)) continue;
+    const m = cfsSlots[sid] || {};
+    const rfid = String(m.rfid ?? "").trim();
+    const hasLiveSignal = (
+      m.present === true ||
+      Number(m.state ?? 0) > 0 ||
+      Number(m.selected ?? 0) === 1 ||
+      m.percent != null ||
+      (rfid && !["0", "00", "000", "0000", "00000", "000000"].includes(rfid))
+    );
+    if (hasLiveSignal) out.add(sid[0]);
+  }
+  return Array.from(out).sort();
+}
+
 function renderCfsStats(state, wrap) {
   if (!wrap) return;
   wrap.innerHTML = '';
@@ -403,7 +422,23 @@ function renderCfsStats(state, wrap) {
 
   const boxesMeta = (state.cfs_slots || {})['_boxes'] || {};
   const activeBoxIds = Object.keys(boxesMeta).map(Number).filter(n => n >= 1 && n <= 4).sort();
-  const boxIds = activeBoxIds.length ? activeBoxIds : [1, 2, 3, 4];
+  const inferredFromStats = Array.from(
+    new Set(
+      Object.entries(stats)
+        .filter(([sid, s]) => /^[1-4][A-D]$/.test(sid) && !!s && (((s.total_meters || 0) > 0) || ((s.total_kg || 0) > 0) || !!s.last_used_at))
+        .map(([sid]) => Number(sid[0]))
+        .filter(n => n >= 1 && n <= 4)
+    )
+  ).sort();
+  const boxIds = activeBoxIds.length ? activeBoxIds : inferredFromStats;
+
+  if (!boxIds.length) {
+    const empty = document.createElement('div');
+    empty.className = 'emptyState';
+    empty.textContent = 'No CFS detected';
+    wrap.appendChild(empty);
+    return;
+  }
 
   for (const b of boxIds) {
     const slotIds = ['A', 'B', 'C', 'D'].map(l => `${b}${l}`);
@@ -615,8 +650,8 @@ function renderPrinter(printerId, state) {
     const bi = boxesInfo[n];
     if (bi && bi.connected === true) connectedBoxes.push(n);
   }
-  // Fallback: if firmware doesn't provide box connection metadata, show Box 1 & 2.
-  if (!connectedBoxes.length) connectedBoxes.push("1", "2");
+  // Fallback: infer from live slot signals if firmware omits box metadata.
+  if (!connectedBoxes.length) connectedBoxes.push(...inferLiveCfsBoxes(state.cfs_slots || {}));
 
   const metaFor = (sid) => {
     // We render slots primarily from Creality CFS data (state.cfs_slots),

@@ -105,6 +105,24 @@
     const boxesMeta = (cfsSlots._boxes) ? cfsSlots._boxes : {};
     const hasLiveCfs = Object.keys(cfsSlots).length > 0;
 
+    function inferLiveCfsBoxes() {
+      const out = new Set();
+      for (const sid of Object.keys(cfsSlots || {})) {
+        if (!/^[1-4][A-D]$/.test(sid)) continue;
+        const m = cfsSlots[sid] || {};
+        const rfid = String(m.rfid ?? '').trim();
+        const hasLiveSignal = (
+          m.present === true ||
+          Number(m.state ?? 0) > 0 ||
+          Number(m.selected ?? 0) === 1 ||
+          m.percent != null ||
+          (rfid && !['0', '00', '000', '0000', '00000', '000000'].includes(rfid))
+        );
+        if (hasLiveSignal) out.add(sid[0]);
+      }
+      return Array.from(out).sort();
+    }
+
     function makePod(sid, cfs, local, isActive) {
       const pod = document.createElement('div');
       pod.className = 'cfsp-slot' + (isActive ? ' active' : '');
@@ -166,7 +184,7 @@
       const b = boxesMeta[n];
       if (b && b.connected === true) connected.push(n);
     }
-    if (!connected.length) connected.push('1', '2');
+    if (!connected.length) connected.push(...inferLiveCfsBoxes());
 
     for (const boxNum of connected) {
       const row = document.createElement('div');

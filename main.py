@@ -1071,16 +1071,21 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
             "present": False,
         }
 
-    # Store box connection metadata so the frontend can show correct boxes
+    # Store box connection metadata so the frontend can show correct boxes.
+    # If no CFS boxes are present, clear stale metadata.
     if boxes_meta:
         st.cfs_slots["_boxes"] = boxes_meta
+    else:
+        st.cfs_slots.pop("_boxes", None)
 
     # Always update active slot — clears stale value when printer is idle
     st.cfs_active_slot = active_slot
     if active_slot and active_slot in st.slots:
         st.active_slot = active_slot
 
-    st.cfs_connected = True
+    # Direct spool holder (SP) is not a CFS. Only mark connected when at least
+    # one CFS box (type 0) is present in the current payload.
+    st.cfs_connected = bool(boxes_meta)
     st.cfs_last_update = _now()
     st.printer_connected = True
     st.printer_last_error = ""
