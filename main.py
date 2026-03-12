@@ -801,6 +801,7 @@ _WS_SAVE_INTERVAL = 10.0
 _ws_last_save: Dict[str, float] = {}
 _ws_last_rfid: Dict[str, Dict[str, str]] = {}   # printer_id → slot → RFID
 _ws_last_state: Dict[str, Dict[str, int]] = {}  # printer_id → slot → CFS state (0/1/2)
+_ws_last_fingerprint: Dict[str, Dict[str, str]] = {}  # printer_id → slot → material fingerprint
 
 _SSH_FETCH_COOLDOWN = 30.0  # seconds between SSH fetches of material_box_info.json
 _ssh_last_fetch: Dict[str, float] = {}
@@ -924,6 +925,7 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
     st = load_state(printer_id)
     last_rfid = _ws_last_rfid.setdefault(printer_id, {})
     last_state = _ws_last_state.setdefault(printer_id, {})
+    last_fingerprint = _ws_last_fingerprint.setdefault(printer_id, {})
     manual_pct = _spoolman_manual_pct.setdefault(printer_id, {})
     active_slot: Optional[str] = None
     boxes_meta: dict = {}
@@ -936,6 +938,9 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
         name_raw = str(mat.get("name") or "").strip()
         vendor_raw = str(mat.get("vendor") or "").strip()
         rfid_raw = str(mat.get("rfid") or "").strip()
+        raw_color = mat.get("color", "")
+        color_norm = _normalize_ws_color(raw_color)
+        slot_fingerprint = "|".join([mat_type_raw, name_raw, vendor_raw, (color_norm or "").lower()])
         rfid_missing = rfid_raw in ("", "0", "00", "000", "0000", "00000", "000000")
         # Creality's "empty spool" option may come through as manual (state=1)
         # with a placeholder material and no identifying metadata. Treat that as
@@ -973,10 +978,8 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
         # Update local slot metadata from WS data (only if a spool is physically present)
         if state_val > 0 and slot in st.slots:
             slot_obj = st.slots[slot]
-            raw_color = mat.get("color", "")
-            col = _normalize_ws_color(raw_color)
-            if col and len(col) == 7 and col.startswith("#"):
-                slot_obj.color_hex = col
+            if color_norm and len(color_norm) == 7 and color_norm.startswith("#"):
+                slot_obj.color_hex = color_norm
             mat_type = (mat.get("type") or "").strip().upper()
             if mat_type:
                 slot_obj.material = mat_type  # type: ignore[assignment]
@@ -988,18 +991,31 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
                 slot_obj.manufacturer = vendor
             st.slots[slot] = slot_obj
 
-        # Detect spool removal/swap and unlink Spoolman.
-        prev_state = last_state.get(slot, -1)
-        last_state[slot] = state_val
-        removed_or_swapped = (prev_state == 2 and state_val != 2) or (prev_state > 0 and state_val == 0)
-        if removed_or_swapped:
+        def _clear_slot_link(reason: str) -> None:
             slot_obj_swap = st.slots.get(slot)
             if slot_obj_swap and getattr(slot_obj_swap, "spoolman_id", None):
                 slot_obj_swap.spoolman_id = None
                 st.slots[slot] = slot_obj_swap
                 st.ws_slot_length_m.pop(slot, None)
                 last_rfid.pop(slot, None)
-                print(f"[CFS] ({printer_id}) Slot {slot}: state {prev_state}→{state_val}, unlinked Spoolman spool")
+                print(f"[CFS] ({printer_id}) Slot {slot}: {reason}, unlinked Spoolman spool")
+
+        # Detect spool removal/swap and unlink Spoolman.
+        prev_state = last_state.get(slot, -1)
+        last_state[slot] = state_val
+        removed_or_swapped = (prev_state == 2 and state_val != 2) or (prev_state > 0 and state_val == 0)
+        if removed_or_swapped:
+            _clear_slot_link(f"state {prev_state}→{state_val}")
+
+        # Detect manual filament metadata changes while state stays loaded.
+        if state_val > 0:
+            prev_fp = last_fingerprint.get(slot, "")
+            if prev_fp and slot_fingerprint and prev_fp != slot_fingerprint:
+                _clear_slot_link("filament metadata changed")
+            if slot_fingerprint:
+                last_fingerprint[slot] = slot_fingerprint
+        else:
+            last_fingerprint.pop(slot, None)
 
         # SSH serialNum-based auto-link is only available for CFS slots.
         if allow_ssh_serial_lookup and state_val == 2 and prev_state != 2:
@@ -1576,6 +1592,7 @@ def api_ui_spool_set_start(req: UiSpoolSetStartRequest) -> ApiResponse:
     # Clear RFID/state cache so re-inserting any spool triggers auto-link again
     _ws_last_rfid.setdefault(pid, {}).pop(slot, None)
     _ws_last_state.setdefault(pid, {}).pop(slot, None)
+    _ws_last_fingerprint.setdefault(pid, {}).pop(slot, None)
     save_state(pid, state)
     return ApiResponse(result=_ui_state_dict(state))
 
