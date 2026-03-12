@@ -419,8 +419,51 @@ function renderCfsStats(state, wrap) {
   wrap.innerHTML = '';
 
   const stats = state.cfs_stats || {};
+  const cfsSlots = state.cfs_slots || {};
+  const localSlots = state.slots || {};
 
-  const boxesMeta = (state.cfs_slots || {})['_boxes'] || {};
+  // Always show direct spool input status in the status panel.
+  const spoolWs = cfsSlots[PRINTER_SPOOL_SLOT] || {};
+  const spoolLocal = localSlots[PRINTER_SPOOL_SLOT] || {};
+  const spoolPresent = spoolWs.present === true;
+  const spoolStats = stats[PRINTER_SPOOL_SLOT] || {};
+  const spoolMaterial = ((spoolWs.material ?? spoolLocal.material) || "").toString().toUpperCase();
+
+  const spoolDiv = document.createElement('div');
+  spoolDiv.className = 'cfsBox';
+  const spoolHead = document.createElement('div');
+  spoolHead.className = 'cfsBoxHead';
+  const spoolHeadLabel = document.createElement('span');
+  spoolHeadLabel.textContent = 'Spool';
+  const spoolHeadTotals = document.createElement('span');
+  spoolHeadTotals.className = 'cfsBoxTotals';
+  spoolHeadTotals.textContent = spoolPresent ? 'loaded' : 'empty';
+  spoolHead.appendChild(spoolHeadLabel);
+  spoolHead.appendChild(spoolHeadTotals);
+  spoolDiv.appendChild(spoolHead);
+
+  const spoolRow = document.createElement('div');
+  spoolRow.className = 'cfsSlotRow';
+  const spoolLabel = document.createElement('span');
+  spoolLabel.className = 'cfsSlotLabel';
+  spoolLabel.textContent = PRINTER_SPOOL_SLOT;
+  const spoolMeters = document.createElement('span');
+  spoolMeters.className = 'cfsSlotMeters';
+  spoolMeters.textContent = spoolPresent ? (spoolMaterial || 'loaded') : 'empty';
+  const spoolKg = document.createElement('span');
+  spoolKg.className = 'cfsSlotKg';
+  spoolKg.textContent = (spoolPresent && spoolWs.percent != null) ? `${spoolWs.percent}%` : '—';
+  const spoolLast = document.createElement('span');
+  spoolLast.className = 'cfsSlotLast';
+  spoolLast.textContent = fmtRelative(spoolStats.last_used_at || null);
+  spoolRow.appendChild(spoolLabel);
+  spoolRow.appendChild(spoolMeters);
+  spoolRow.appendChild(spoolKg);
+  spoolRow.appendChild(spoolLast);
+  spoolDiv.appendChild(spoolRow);
+  wrap.appendChild(spoolDiv);
+
+  const boxesMeta = cfsSlots['_boxes'] || {};
   const activeBoxIds = Object.keys(boxesMeta).map(Number).filter(n => n >= 1 && n <= 4).sort();
   const inferredFromStats = Array.from(
     new Set(
@@ -455,7 +498,7 @@ function renderCfsStats(state, wrap) {
     const head = document.createElement('div');
     head.className = 'cfsBoxHead';
     const headLabel = document.createElement('span');
-    headLabel.textContent = `Box ${b}`;
+    headLabel.textContent = `CFS Box ${b}`;
     const headTotals = document.createElement('span');
     headTotals.className = 'cfsBoxTotals';
     headTotals.textContent = `${boxMeters.toFixed(1)} m  ·  ${fmtG(boxKg * 1000)}`;
@@ -623,7 +666,7 @@ function renderPrinter(printerId, state) {
   statsHead.className = "cardHead";
   const statsTitle = document.createElement("div");
   statsTitle.className = "cardTitle";
-  statsTitle.textContent = "CFS Stats";
+  statsTitle.textContent = "Status";
   const statsMeta = document.createElement("div");
   statsMeta.className = "cardMeta";
   statsHead.appendChild(statsTitle);
