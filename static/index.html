@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>CFSync</title>
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico" />
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
@@ -42,11 +43,13 @@
       <div id="printersWrap" class="printersWrap"></div>
 
       <footer class="footer">
-        <span>Tip: If colors/material are not shown, set <code>printer_urls</code> (or <code>printers</code>) in <code>data/config.json</code> to your printer IPs.</span>
-        <span class="footerSep">·</span>
         <span class="footerBookmark">
           <a id="fluiddBookmarklet" class="footerLink" href="#" title="Drag to bookmarks bar, then click in Fluidd to replace the Runout Sensors card with live CFS status">Fluidd panel</a>
           <button id="fluiddCopyBtn" class="footerCopyBtn" title="Copy bookmarklet to clipboard">⎘</button>
+        </span>
+        <span class="footerSep">·</span>
+        <span class="footerBookmark">
+          <button id="fluiddUserscriptBtn" class="footerCopyBtn" title="Generate a Tampermonkey userscript that auto-loads the panel on every Fluidd page visit">Tampermonkey script</button>
         </span>
       </footer>
     </main>
@@ -83,13 +86,8 @@
               </div>
             </div>
           </div>
-          <div class="formRow">
-            <label>New roll (g)</label>
-            <input id="spoolStart" type="number" min="1" step="1" placeholder="e.g. 1000" />
-            <button id="spoolSaveStart" class="btn">Roll change</button>
-          </div>
           <div class="modalStats" id="spoolStats"></div>
-          <div class="modalHint">Note: This saves locally in this app only (no POST to printer). Roll change unlinks the Spoolman spool.</div>
+          <div class="modalHint">Note: This saves locally in this app only (no POST to printer).</div>
         </div>
       </div>
     </div>

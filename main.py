@@ -690,33 +690,38 @@ def _spoolman_autolink_by_rfid(slot: str, rfid: str, st, printer_id: str) -> Non
 
 
 async def _fetch_printer_material_json(printer_id: str) -> Optional[dict]:
-    """SFTP-fetch material_box_info.json from the printer (runs in thread executor)."""
+    """Fetch material_box_info.json from the printer via SSH (system ssh binary)."""
     host = (_printer_address(printer_id) or "").strip().split(":")[0]
     if not host:
         return None
 
-    def _sftp_get() -> Optional[dict]:
+    def _ssh_cat() -> Optional[dict]:
+        import subprocess
         try:
-            import paramiko  # lazy import — optional dependency
-        except ImportError:
-            print("[SSH] paramiko not installed; run: pip install paramiko")
+            result = subprocess.run(
+                [
+                    "sshpass", "-p", "creality_2023",
+                    "ssh",
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "ConnectTimeout=5",
+                    f"root@{host}",
+                    "cat /usr/data/creality/userdata/box/material_box_info.json",
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return json.loads(result.stdout)
+            print(f"[SSH] fetch failed ({host}): {result.stderr.strip() or 'no output'}")
             return None
-        try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(host, username="root", password="creality_2023", timeout=5,
-                        allow_agent=False, look_for_keys=False)
-            sftp = ssh.open_sftp()
-            with sftp.open("/usr/data/creality/userdata/box/material_box_info.json") as fh:
-                data = json.loads(fh.read())
-            sftp.close()
-            ssh.close()
-            return data
+        except FileNotFoundError:
+            print("[SSH] sshpass not found; run: apt install sshpass")
+            return None
         except Exception as e:
             print(f"[SSH] fetch failed ({host}): {e}")
             return None
 
-    return await asyncio.get_event_loop().run_in_executor(None, _sftp_get)
+    return await asyncio.get_event_loop().run_in_executor(None, _ssh_cat)
 
 
 def _apply_serialnum_links(info: dict, printer_id: str) -> None:
@@ -729,7 +734,7 @@ def _apply_serialnum_links(info: dict, printer_id: str) -> None:
         box_id_str = box.get("boxID", "")   # "T1" .. "T4"
         if not box_id_str.startswith("T"):
             continue
-        box_num = box_id_str[1:]            # "1" .. "4"
+        box_num = box_id_str[1:]
 
         for mat in (box.get("list") or []):
             mat_id = mat.get("materialId", "")   # "A" .. "D"
@@ -749,9 +754,8 @@ def _apply_serialnum_links(info: dict, printer_id: str) -> None:
 
             slot_obj = st.slots.get(slot)
             if slot_obj and getattr(slot_obj, "spoolman_id", None) == spool_id:
-                continue  # already linked correctly
+                continue  # already linked
 
-            # Verify spool exists in Spoolman before linking
             if base:
                 try:
                     spool = _http_get_json(f"{base}/api/v1/spool/{spool_id}", timeout=5.0)
@@ -930,12 +934,10 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
         state_val = int(mat.get("state") or 0)
         selected = int(mat.get("selected") or 0)
 
-        # state 2 = RFID: WS percent is real sensor data → use it
+        # state 2 = RFID: use Spoolman-based calc (same behavior as manual slots)
         # state 1 = manual: WS always reports 100 (no sensor) → use Spoolman cache
         # state 0 = empty: no percent
-        if state_val == 2:
-            pct = mat.get("percent")
-        elif state_val == 1:
+        if state_val in (1, 2):
             pct = manual_pct.get(slot)  # None until async refresh fills it
         else:
             pct = None
@@ -1074,7 +1076,7 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
 
 
 async def _refresh_manual_slot_pcts(printer_id: str) -> None:
-    """Calculate Spoolman-based percent for manual (non-RFID) slots and cache it.
+    """Calculate Spoolman-based percent for all linked slots (manual and RFID) and cache it.
 
     Called after each boxsInfo parse. Uses a per-slot TTL so Spoolman is queried
     at most once per _SPOOLMAN_PCT_TTL seconds per slot.
@@ -1089,7 +1091,7 @@ async def _refresh_manual_slot_pcts(printer_id: str) -> None:
     pct_refresh = _spoolman_pct_refresh_at.setdefault(printer_id, {})
 
     for slot, cfs_meta in list(st.cfs_slots.items()):
-        if not isinstance(cfs_meta, dict) or cfs_meta.get("state") != 1:
+        if not isinstance(cfs_meta, dict) or cfs_meta.get("state") not in (1, 2):
             continue
         slot_obj = st.slots.get(slot)
         spool_id = getattr(slot_obj, "spoolman_id", None) if slot_obj else None
@@ -1113,7 +1115,8 @@ async def _refresh_manual_slot_pcts(printer_id: str) -> None:
                 pct = None
             manual_pct[slot] = pct
             pct_refresh[slot] = now + _SPOOLMAN_PCT_TTL
-            print(f"[SPOOLMAN] ({printer_id}) Slot {slot} manual percent: {pct}%")
+            state_label = "RFID" if cfs_meta.get("state") == 2 else "manual"
+            print(f"[SPOOLMAN] ({printer_id}) Slot {slot} {state_label} percent: {pct}%")
         except Exception:
             pct_refresh[slot] = now + 10.0  # back off on error
 
@@ -1121,11 +1124,16 @@ async def _refresh_manual_slot_pcts(printer_id: str) -> None:
 async def _ws_connect_and_run(ws_url: str, printer_id: str) -> None:
     """Open one WebSocket connection to the printer and run the polling loop."""
     async with websockets.connect(ws_url, ping_interval=None, ping_timeout=None) as ws:
-        # Skip only the very first burst (max 5 messages, 0.15 s each).
-        # We keep this minimal — real CFS data arrives immediately and we must not lose it.
+        # Consume the very first burst (max 5 messages, 0.15 s each).
+        # Parse for printer identity (hostname/modelVersion) but skip CFS data,
+        # which may be stale at this point.
         for _ in range(5):
             try:
-                await asyncio.wait_for(ws.recv(), timeout=0.15)
+                msg = await asyncio.wait_for(ws.recv(), timeout=0.15)
+                try:
+                    _parse_ws_printer_info(json.loads(msg), printer_id)
+                except Exception:
+                    pass
             except asyncio.TimeoutError:
                 break
 
