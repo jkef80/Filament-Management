@@ -420,14 +420,12 @@ function renderCfsStats(state, wrap) {
 
   const stats = state.cfs_stats || {};
   const cfsSlots = state.cfs_slots || {};
-  const localSlots = state.slots || {};
 
-  // Always show direct spool input status in the status panel.
-  const spoolWs = cfsSlots[PRINTER_SPOOL_SLOT] || {};
-  const spoolLocal = localSlots[PRINTER_SPOOL_SLOT] || {};
-  const spoolPresent = spoolWs.present === true;
+  // Always show direct spool input status in the status panel, using the
+  // same distance/grams metrics as CFS slots.
   const spoolStats = stats[PRINTER_SPOOL_SLOT] || {};
-  const spoolMaterial = ((spoolWs.material ?? spoolLocal.material) || "").toString().toUpperCase();
+  const spoolMetersVal = Number(spoolStats.total_meters || 0);
+  const spoolKgVal = Number(spoolStats.total_kg || 0);
 
   const spoolDiv = document.createElement('div');
   spoolDiv.className = 'cfsBox';
@@ -437,7 +435,7 @@ function renderCfsStats(state, wrap) {
   spoolHeadLabel.textContent = 'Spool';
   const spoolHeadTotals = document.createElement('span');
   spoolHeadTotals.className = 'cfsBoxTotals';
-  spoolHeadTotals.textContent = spoolPresent ? 'loaded' : 'empty';
+  spoolHeadTotals.textContent = `${spoolMetersVal.toFixed(1)} m  ·  ${fmtG(spoolKgVal * 1000)}`;
   spoolHead.appendChild(spoolHeadLabel);
   spoolHead.appendChild(spoolHeadTotals);
   spoolDiv.appendChild(spoolHead);
@@ -449,10 +447,10 @@ function renderCfsStats(state, wrap) {
   spoolLabel.textContent = PRINTER_SPOOL_SLOT;
   const spoolMeters = document.createElement('span');
   spoolMeters.className = 'cfsSlotMeters';
-  spoolMeters.textContent = spoolPresent ? (spoolMaterial || 'loaded') : 'empty';
+  spoolMeters.textContent = spoolMetersVal.toFixed(1) + ' m';
   const spoolKg = document.createElement('span');
   spoolKg.className = 'cfsSlotKg';
-  spoolKg.textContent = (spoolPresent && spoolWs.percent != null) ? `${spoolWs.percent}%` : '—';
+  spoolKg.textContent = fmtG(spoolKgVal * 1000);
   const spoolLast = document.createElement('span');
   spoolLast.className = 'cfsSlotLast';
   spoolLast.textContent = fmtRelative(spoolStats.last_used_at || null);
