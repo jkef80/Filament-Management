@@ -624,8 +624,23 @@ function renderPrinter(printerId, state) {
     // Therefore we must merge both.
     const m = (slots && slots[sid]) ? slots[sid] : {};
     const local = (localSlots && localSlots[sid]) ? localSlots[sid] : {};
-    const defaultPresent = sid === PRINTER_SPOOL_SLOT ? false : true;
-    const present = (m.present ?? local.present ?? defaultPresent);
+    const hasLiveCfs = !!(state.cfs_slots && Object.keys(state.cfs_slots).length);
+    const localHasSpool = !!(
+      local.spoolman_id ||
+      local.name ||
+      local.manufacturer ||
+      (String(local.material || "").toUpperCase() && String(local.material || "").toUpperCase() !== "OTHER")
+    );
+    const defaultPresent = hasLiveCfs ? false : localHasSpool;
+    let present = (m.present ?? local.present ?? defaultPresent);
+    const wsState = Number(m.state ?? -1);
+    const wsRfid = String(m.rfid ?? "").trim();
+    const wsRfidMissing = ["", "0", "00", "000", "0000", "00000", "000000"].includes(wsRfid);
+    const mergedMaterial = String((m.material ?? local.material) || "").toUpperCase();
+    const mergedName = String((m.name ?? local.name) || "").trim();
+    const mergedVendor = String((m.manufacturer ?? m.vendor ?? local.manufacturer ?? local.vendor) || "").trim();
+    const looksLikeEmptyManual = wsState === 1 && wsRfidMissing && !mergedName && !mergedVendor && (!mergedMaterial || mergedMaterial === "OTHER");
+    if (looksLikeEmptyManual) present = false;
 
     // normalize fields from either cfs_slots or local slots
     const out = {

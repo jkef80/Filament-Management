@@ -103,12 +103,27 @@
     const localSlots = state.slots || {};
     const active = state.cfs_active_slot || null;
     const boxesMeta = (cfsSlots._boxes) ? cfsSlots._boxes : {};
+    const hasLiveCfs = Object.keys(cfsSlots).length > 0;
 
     function makePod(sid, cfs, local, isActive) {
       const pod = document.createElement('div');
       pod.className = 'cfsp-slot' + (isActive ? ' active' : '');
 
-      const present = (cfs.present ?? local.present ?? (sid === PRINTER_SPOOL_SLOT ? false : true));
+      const localHasSpool = !!(
+        local.spoolman_id ||
+        local.name ||
+        local.manufacturer ||
+        (String(local.material || '').toUpperCase() && String(local.material || '').toUpperCase() !== 'OTHER')
+      );
+      let present = (cfs.present ?? local.present ?? (hasLiveCfs ? false : localHasSpool));
+      const wsState = Number(cfs.state ?? -1);
+      const wsRfid = String(cfs.rfid ?? '').trim();
+      const wsRfidMissing = ['', '0', '00', '000', '0000', '00000', '000000'].includes(wsRfid);
+      const mergedMaterial = String((cfs.material || local.material || '')).toUpperCase();
+      const mergedName = String((cfs.name || local.name || '')).trim();
+      const mergedVendor = String((cfs.manufacturer || cfs.vendor || local.manufacturer || local.vendor || '')).trim();
+      const looksLikeEmptyManual = wsState === 1 && wsRfidMissing && !mergedName && !mergedVendor && (!mergedMaterial || mergedMaterial === 'OTHER');
+      if (looksLikeEmptyManual) present = false;
 
       // Color swatch
       const dot = document.createElement('div');

@@ -936,12 +936,13 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
         name_raw = str(mat.get("name") or "").strip()
         vendor_raw = str(mat.get("vendor") or "").strip()
         rfid_raw = str(mat.get("rfid") or "").strip()
+        rfid_missing = rfid_raw in ("", "0", "00", "000", "0000", "00000", "000000")
         # Creality's "empty spool" option may come through as manual (state=1)
         # with a placeholder material and no identifying metadata. Treat that as
         # truly empty so UI/rendering does not show "OTHER".
         empty_manual_signature = (
             raw_state_val == 1
-            and not rfid_raw
+            and rfid_missing
             and not name_raw
             and not vendor_raw
             and mat_type_raw in ("", "-", "—", "–", "N/A", "NA", "NONE", "OTHER")
@@ -1588,9 +1589,12 @@ def api_ui_spoolman_spools(slot: str = "1A", printer_id: Optional[str] = None):
     state = load_state(pid)
     s = state.slots.get(slot)
     cfs_slot = state.cfs_slots.get(slot) if isinstance(state.cfs_slots, dict) else None
+    has_cfs_snapshot = isinstance(state.cfs_slots, dict) and bool(state.cfs_slots)
     slot_present = True
     if isinstance(cfs_slot, dict):
         slot_present = bool(cfs_slot.get("present", True))
+    elif has_cfs_snapshot:
+        slot_present = False
     slot_material = (getattr(s, "material", "") or "").upper() if (s and slot_present) else ""
     slot_color = (getattr(s, "color_hex", "") or "").lower() if (s and slot_present) else ""
 
