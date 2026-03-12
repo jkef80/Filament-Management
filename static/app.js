@@ -912,7 +912,7 @@ function render(ui) {
     if (!total) {
       badge(cfsBadge, "CFS: —", "warn");
     } else {
-      badge(cfsBadge, `CFS: ${cfsOk}/${total} detected`, cfsOk > 0 ? "ok" : "warn");
+      badge(cfsBadge, `CFS: ${cfsOk} detected`, cfsOk > 0 ? "ok" : "warn");
     }
   }
 
