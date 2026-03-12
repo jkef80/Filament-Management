@@ -21,6 +21,7 @@
   }
 
   const POLL_MS = 3000;
+  const PRINTER_SPOOL_SLOT = 'SP';
   let slotsContainer = null;
   let statusEl = null;
   let pollTimer = null;
@@ -103,6 +104,47 @@
     const active = state.cfs_active_slot || null;
     const boxesMeta = (cfsSlots._boxes) ? cfsSlots._boxes : {};
 
+    function makePod(sid, cfs, local, isActive) {
+      const pod = document.createElement('div');
+      pod.className = 'cfsp-slot' + (isActive ? ' active' : '');
+
+      const present = (cfs.present ?? local.present ?? (sid === PRINTER_SPOOL_SLOT ? false : true));
+
+      // Color swatch
+      const dot = document.createElement('div');
+      dot.className = 'cfsp-dot';
+      const rawColor = (cfs.color || cfs.color_hex || local.color_hex || '').toString().toLowerCase();
+      if (rawColor && present !== false) {
+        dot.style.background = rawColor.startsWith('#') ? rawColor : '#' + rawColor;
+      }
+      pod.appendChild(dot);
+
+      // Slot ID
+      const idEl = document.createElement('div');
+      idEl.className = 'cfsp-id';
+      idEl.textContent = sid;
+      pod.appendChild(idEl);
+
+      // Material
+      const mat = ((cfs.material || local.material) || '').toString().toUpperCase();
+      if (present !== false && mat) {
+        const matEl = document.createElement('div');
+        matEl.className = 'cfsp-mat';
+        matEl.textContent = mat;
+        pod.appendChild(matEl);
+      }
+
+      // Percent remaining
+      if (present !== false && cfs.percent != null) {
+        const pctEl = document.createElement('div');
+        pctEl.className = 'cfsp-pct';
+        pctEl.textContent = cfs.percent + '%';
+        pod.appendChild(pctEl);
+      }
+
+      return pod;
+    }
+
     // Which boxes are connected?
     const connected = [];
     for (const n of ['1', '2', '3', '4']) {
@@ -128,47 +170,31 @@
         const cfs = cfsSlots[sid] || {};
         const local = localSlots[sid] || {};
         const isActive = sid === active;
-
-        const pod = document.createElement('div');
-        pod.className = 'cfsp-slot' + (isActive ? ' active' : '');
-
-        // Color swatch
-        const dot = document.createElement('div');
-        dot.className = 'cfsp-dot';
-        const rawColor = (cfs.color || cfs.color_hex || local.color_hex || '').toString().toLowerCase();
-        if (rawColor && cfs.present !== false) {
-          dot.style.background = rawColor.startsWith('#') ? rawColor : '#' + rawColor;
-        }
-        pod.appendChild(dot);
-
-        // Slot ID
-        const idEl = document.createElement('div');
-        idEl.className = 'cfsp-id';
-        idEl.textContent = sid;
-        pod.appendChild(idEl);
-
-        // Material
-        const mat = ((cfs.material || local.material) || '').toString().toUpperCase();
-        if (mat) {
-          const matEl = document.createElement('div');
-          matEl.className = 'cfsp-mat';
-          matEl.textContent = mat;
-          pod.appendChild(matEl);
-        }
-
-        // Percent remaining
-        if (cfs.percent != null) {
-          const pctEl = document.createElement('div');
-          pctEl.className = 'cfsp-pct';
-          pctEl.textContent = cfs.percent + '%';
-          pod.appendChild(pctEl);
-        }
-
-        slotWrap.appendChild(pod);
+        slotWrap.appendChild(makePod(sid, cfs, local, isActive));
       }
       row.appendChild(slotWrap);
       slotsContainer.appendChild(row);
     }
+
+    // Direct printer spool holder (single slot, outside the 4x4 CFS grid)
+    const spoolRow = document.createElement('div');
+    spoolRow.className = 'cfsp-box';
+    const spoolLbl = document.createElement('div');
+    spoolLbl.className = 'cfsp-box-lbl';
+    spoolLbl.textContent = 'Spool';
+    spoolRow.appendChild(spoolLbl);
+    const spoolWrap = document.createElement('div');
+    spoolWrap.className = 'cfsp-slots';
+    spoolWrap.appendChild(
+      makePod(
+        PRINTER_SPOOL_SLOT,
+        cfsSlots[PRINTER_SPOOL_SLOT] || {},
+        localSlots[PRINTER_SPOOL_SLOT] || {},
+        PRINTER_SPOOL_SLOT === active
+      )
+    );
+    spoolRow.appendChild(spoolWrap);
+    slotsContainer.appendChild(spoolRow);
 
     if (statusEl) {
       const ok = !!state.cfs_connected;

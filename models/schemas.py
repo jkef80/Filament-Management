@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Literal, Optional, Any
+from typing import Dict, Literal, Optional, Any, Union
 import time
 from datetime import datetime, timezone
 from pydantic import BaseModel, Field, field_validator
@@ -11,12 +11,14 @@ SlotId = Literal[
     "3A", "3B", "3C", "3D",
     "4A", "4B", "4C", "4D",
 ]
+PrinterSpoolSlotId = Literal["SP"]
+PrinterInputId = Union[SlotId, PrinterSpoolSlotId]
 
 MaterialType = Literal["PLA", "PETG", "ABS", "ASA", "TPU", "PA", "PC", "OTHER"]
 
 
 class SlotState(BaseModel):
-    slot: SlotId
+    slot: PrinterInputId
     material: MaterialType = "PLA"
     color_hex: str = Field(default="#00aaff", pattern=r"^#[0-9a-fA-F]{6}$")
     name: str = ""
@@ -54,7 +56,7 @@ class SlotStats(BaseModel):
 class AppState(BaseModel):
     active_slot: Optional[str] = None  # legacy; frontend uses cfs_active_slot
     auto_mode: bool = False
-    slots: Dict[SlotId, SlotState]
+    slots: Dict[PrinterInputId, SlotState]
     updated_at: float = Field(default_factory=lambda: time.time())
 
     # printer connection info
@@ -64,7 +66,7 @@ class AppState(BaseModel):
     # CFS / AMS info (read-only from printer, optional)
     cfs_connected: bool = False
     cfs_last_update: float = 0.0
-    cfs_active_slot: Optional[SlotId] = None
+    cfs_active_slot: Optional[PrinterInputId] = None
     cfs_slots: Dict[str, Any] = Field(default_factory=dict)
 
     # Per-slot cumulative usedMaterialLength (m) from last WS snapshot.
@@ -111,7 +113,7 @@ class UpdateSlotRequest(BaseModel):
 
 class SelectSlotRequest(BaseModel):
     printer_id: Optional[str] = None
-    slot: SlotId
+    slot: PrinterInputId
 
 
 class SetAutoRequest(BaseModel):
@@ -136,13 +138,13 @@ class ApiResponse(BaseModel):
 
 class UiSetColorRequest(BaseModel):
     printer_id: Optional[str] = None
-    slot: SlotId
+    slot: PrinterInputId
     color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
 
 
 class UiSlotUpdateRequest(BaseModel):
     printer_id: Optional[str] = None
-    slot: SlotId
+    slot: PrinterInputId
     material: Optional[MaterialType] = None
     color: Optional[str] = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
     name: Optional[str] = None
@@ -151,19 +153,19 @@ class UiSlotUpdateRequest(BaseModel):
 
 class UiSpoolSetStartRequest(BaseModel):
     printer_id: Optional[str] = None
-    slot: SlotId
+    slot: PrinterInputId
     start_g: Optional[float] = None  # accepted for backward compat, not stored locally
 
 
 class SpoolmanLinkRequest(BaseModel):
     printer_id: Optional[str] = None
-    slot: SlotId
+    slot: PrinterInputId
     spoolman_id: int = Field(gt=0)
 
 
 class SpoolmanUnlinkRequest(BaseModel):
     printer_id: Optional[str] = None
-    slot: SlotId
+    slot: PrinterInputId
 
 
 class MultiAppState(BaseModel):

@@ -1,6 +1,12 @@
 /* Minimal read-only UI for Creality K2 Plus CFS via Moonraker */
 
 const $ = (id) => document.getElementById(id);
+const PRINTER_SPOOL_SLOT = "SP";
+
+function slotTitle(slotId) {
+  if (slotId === PRINTER_SPOOL_SLOT) return "Printer Spool Input";
+  return `Box ${slotId[0]} · Slot ${slotId[1]}`;
+}
 
 function fmtTs(ts) {
   if (!ts) return "—";
@@ -162,7 +168,7 @@ function openSpoolModal(slotId, meta, printerId) {
 
   const title = $('spoolTitle');
   const sub = $('spoolSub');
-  if (title) title.textContent = `Box ${slotId[0]} · Slot ${slotId[1]}`;
+  if (title) title.textContent = slotTitle(slotId);
   if (sub) sub.textContent = `${meta.material || '—'} · ${(meta.color || '').toUpperCase() || '—'}`;
 
   // New roll input stays empty by default
@@ -611,10 +617,11 @@ function renderPrinter(printerId, state) {
     // Therefore we must merge both.
     const m = (slots && slots[sid]) ? slots[sid] : {};
     const local = (localSlots && localSlots[sid]) ? localSlots[sid] : {};
+    const defaultPresent = sid === PRINTER_SPOOL_SLOT ? false : true;
 
     // normalize fields from either cfs_slots or local slots
     const out = {
-      present: (m.present ?? local.present ?? true),
+      present: (m.present ?? local.present ?? defaultPresent),
       material: ((m.material ?? local.material) || "").toString().toUpperCase(),
       color: ((m.color ?? m.color_hex ?? local.color ?? local.color_hex) || "").toString().toLowerCase(),
 
@@ -631,6 +638,51 @@ function renderPrinter(printerId, state) {
     };
     return out;
   };
+
+  function makeSlotPod(sid, m, isAct) {
+    const pod = document.createElement("div");
+    pod.className = "slotPod" + (isAct ? " active" : "");
+    pod.dataset.slotid = sid;
+
+    // Slot ID badge
+    const idBadge = document.createElement("div");
+    idBadge.className = "slotPodId";
+    idBadge.textContent = sid;
+    pod.appendChild(idBadge);
+
+    // Spool graphic
+    const spoolWrap = document.createElement("div");
+    spoolWrap.className = "slotPodSpool";
+    spoolWrap.innerHTML = makeSpoolSvg(m);
+    pod.appendChild(spoolWrap);
+
+    // Material — only shown when slot is occupied
+    const matEl = document.createElement("div");
+    matEl.className = "slotPodMaterial";
+    matEl.textContent = m.present === false ? "" : (m.material || "—");
+    pod.appendChild(matEl);
+
+    // Percent remaining (if available from CFS/WS)
+    if (m.present !== false && m.percent != null) {
+      const pctEl = document.createElement("div");
+      pctEl.className = "slotPodPct";
+      pctEl.textContent = m.percent + "%";
+      pod.appendChild(pctEl);
+    }
+
+    // Spoolman link indicator dot
+    const linkDot = document.createElement("div");
+    linkDot.className = "slotPodLink" + (m.spoolman_id ? " linked" : "");
+    linkDot.title = m.spoolman_id ? "Linked to Spoolman #" + m.spoolman_id : "Not linked to Spoolman";
+    pod.appendChild(linkDot);
+
+    pod.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      openSpoolModal(sid, m, printerId);
+    });
+
+    return pod;
+  }
 
   function makeBoxCard(boxNum) {
     const row = document.createElement("div");
@@ -670,51 +722,30 @@ function renderPrinter(printerId, state) {
       const sid = `${boxNum}${letter}`;
       const m = metaFor(sid);
       const isAct = sid === active;
-
-      const pod = document.createElement("div");
-      pod.className = "slotPod" + (isAct ? " active" : "");
-      pod.dataset.slotid = sid;
-
-      // Slot ID badge
-      const idBadge = document.createElement("div");
-      idBadge.className = "slotPodId";
-      idBadge.textContent = sid;
-      pod.appendChild(idBadge);
-
-      // Spool graphic
-      const spoolWrap = document.createElement("div");
-      spoolWrap.className = "slotPodSpool";
-      spoolWrap.innerHTML = makeSpoolSvg(m);
-      pod.appendChild(spoolWrap);
-
-      // Material — only shown when slot is occupied
-      const matEl = document.createElement("div");
-      matEl.className = "slotPodMaterial";
-      matEl.textContent = m.present === false ? "" : (m.material || "—");
-      pod.appendChild(matEl);
-
-      // Percent remaining (if available from CFS)
-      if (m.present !== false && m.percent != null) {
-        const pctEl = document.createElement("div");
-        pctEl.className = "slotPodPct";
-        pctEl.textContent = m.percent + "%";
-        pod.appendChild(pctEl);
-      }
-
-      // Spoolman link indicator dot
-      const linkDot = document.createElement("div");
-      linkDot.className = "slotPodLink" + (m.spoolman_id ? " linked" : "");
-      linkDot.title = m.spoolman_id ? "Linked to Spoolman #" + m.spoolman_id : "Not linked to Spoolman";
-      pod.appendChild(linkDot);
-
-      pod.addEventListener("click", (ev) => {
-        ev.preventDefault();
-        openSpoolModal(sid, m, printerId);
-      });
-
-      slotsWrap.appendChild(pod);
+      slotsWrap.appendChild(makeSlotPod(sid, m, isAct));
     }
 
+    row.appendChild(slotsWrap);
+    return row;
+  }
+
+  function makeSpoolInputCard() {
+    const row = document.createElement("div");
+    row.className = "boxRow";
+
+    const header = document.createElement("div");
+    header.className = "boxHeader";
+    const hTitle = document.createElement("div");
+    hTitle.className = "boxHeaderTitle";
+    hTitle.textContent = "Spool";
+    header.appendChild(hTitle);
+    row.appendChild(header);
+
+    const slotsWrap = document.createElement("div");
+    slotsWrap.className = "boxSlots boxSlotsSingle";
+    const m = metaFor(PRINTER_SPOOL_SLOT);
+    const isAct = PRINTER_SPOOL_SLOT === active;
+    slotsWrap.appendChild(makeSlotPod(PRINTER_SPOOL_SLOT, m, isAct));
     row.appendChild(slotsWrap);
     return row;
   }
@@ -722,6 +753,7 @@ function renderPrinter(printerId, state) {
   for (const b of connectedBoxes) {
     boxesGrid.appendChild(makeBoxCard(b));
   }
+  boxesGrid.appendChild(makeSpoolInputCard());
 
   // Right-side CFS stats panel
   renderCfsStats(state, history);
@@ -729,7 +761,7 @@ function renderPrinter(printerId, state) {
   // Active card
   if (active && (slots[active] || localSlots[active])) {
     const m = metaFor(active);
-    activeRow.appendChild(slotEl(active, `Box ${active[0]} · Slot ${active[1]}`, m, true, printerId));
+    activeRow.appendChild(slotEl(active, slotTitle(active), m, true, printerId));
     activeMeta.textContent = m.material ? (m.material + " · " + (m.color ? m.color.toUpperCase() : "")) : "—";
   } else {
     activeMeta.textContent = "—";

@@ -72,6 +72,7 @@ DEFAULT_SLOTS = [
     "3A", "3B", "3C", "3D",
     "4A", "4B", "4C", "4D",
 ]
+PRINTER_SPOOL_SLOT = "SP"
 
 
 def _now() -> float:
@@ -346,6 +347,16 @@ def _migrate_app_state_dict(data: dict) -> dict:
                     "name": "",
                     "manufacturer": "",
                 }
+        # Ensure the printer's direct spool input exists too.
+        if PRINTER_SPOOL_SLOT not in slots:
+            slots[PRINTER_SPOOL_SLOT] = {
+                "slot": PRINTER_SPOOL_SLOT,
+                "material": "OTHER",
+                "color_hex": "#00aaff",
+                "name": "",
+                "manufacturer": "",
+                "spoolman_id": None,
+            }
         data["slots"] = slots
 
     data.setdefault("printer_connected", False)
@@ -723,7 +734,7 @@ def _apply_serialnum_links(info: dict, printer_id: str) -> None:
         for mat in (box.get("list") or []):
             mat_id = mat.get("materialId", "")   # "A" .. "D"
             slot = f"{box_num}{mat_id}"
-            if slot not in _VALID_SLOT_IDS:
+            if slot not in _VALID_CFS_SLOT_IDS:
                 continue
 
             serial = (mat.get("serialNum") or "").strip()
@@ -795,7 +806,7 @@ _moon_last_filament_mm: Dict[str, float] = {}                   # printer_id →
 _moon_job_track_slot_g: Dict[str, Dict[str, float]] = {}         # printer_id → slot → grams
 _moon_job_track_slot_mm: Dict[str, Dict[str, float]] = {}        # printer_id → slot → mm
 
-_VALID_SLOT_IDS = frozenset(
+_VALID_CFS_SLOT_IDS = frozenset(
     f"{b}{l}" for b in "1234" for l in "ABCD"
 )
 
@@ -912,111 +923,134 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
     manual_pct = _spoolman_manual_pct.setdefault(printer_id, {})
     active_slot: Optional[str] = None
     boxes_meta: dict = {}
+    seen_slots: set[str] = set()
+
+    def _process_material_slot(slot: str, mat: dict, *, allow_ssh_serial_lookup: bool) -> None:
+        nonlocal active_slot
+        state_val = int(mat.get("state") or 0)
+        selected = int(mat.get("selected") or 0)
+
+        # state 2 = RFID: WS percent is real sensor data → use it
+        # state 1 = manual: WS always reports 100 (no sensor) → use Spoolman cache
+        # state 0 = empty: no percent
+        if state_val == 2:
+            pct = mat.get("percent")
+        elif state_val == 1:
+            pct = manual_pct.get(slot)  # None until async refresh fills it
+        else:
+            pct = None
+
+        st.cfs_slots[slot] = {
+            "percent": pct,
+            "state": state_val,
+            "rfid": mat.get("rfid", ""),
+            "selected": selected,
+            "present": state_val > 0,
+        }
+        seen_slots.add(slot)
+
+        if selected == 1:
+            active_slot = slot
+
+        # Update local slot metadata from WS data (only if a spool is physically present)
+        if state_val > 0 and slot in st.slots:
+            slot_obj = st.slots[slot]
+            raw_color = mat.get("color", "")
+            col = _normalize_ws_color(raw_color)
+            if col and len(col) == 7 and col.startswith("#"):
+                slot_obj.color_hex = col
+            mat_type = (mat.get("type") or "").strip().upper()
+            if mat_type:
+                slot_obj.material = mat_type  # type: ignore[assignment]
+            name = (mat.get("name") or "").strip()
+            if name:
+                slot_obj.name = name
+            vendor = (mat.get("vendor") or "").strip()
+            if vendor:
+                slot_obj.manufacturer = vendor
+            st.slots[slot] = slot_obj
+
+        # Detect RFID→non-RFID swap: unlink Spoolman when state drops from 2
+        prev_state = last_state.get(slot, -1)
+        last_state[slot] = state_val
+        if prev_state == 2 and state_val != 2:
+            slot_obj_swap = st.slots.get(slot)
+            if slot_obj_swap and getattr(slot_obj_swap, "spoolman_id", None):
+                slot_obj_swap.spoolman_id = None
+                st.slots[slot] = slot_obj_swap
+                st.ws_slot_length_m.pop(slot, None)
+                last_rfid.pop(slot, None)
+                print(f"[CFS] ({printer_id}) Slot {slot}: state {prev_state}→{state_val}, unlinked Spoolman spool (spool swap)")
+
+        # SSH serialNum-based auto-link is only available for CFS slots.
+        if allow_ssh_serial_lookup and state_val == 2 and prev_state != 2:
+            now = time.time()
+            if now - _ssh_last_fetch.get(printer_id, 0.0) > _SSH_FETCH_COOLDOWN:
+                asyncio.create_task(_ssh_fetch_and_apply(printer_id))
+
+        # RFID-based auto-link: react to any RFID change on this slot
+        rfid = mat.get("rfid", "")
+        if rfid and state_val == 2:  # state 2 = RFID-tagged spool
+            prev_rfid = last_rfid.get(slot, "")
+            if rfid != prev_rfid:
+                last_rfid[slot] = rfid
+                slot_obj2 = st.slots.get(slot)
+                if slot_obj2:
+                    if getattr(slot_obj2, "spoolman_id", None):
+                        # RFID changed on a linked slot — implicit spool swap
+                        slot_obj2.spoolman_id = None
+                        st.slots[slot] = slot_obj2
+                        st.ws_slot_length_m.pop(slot, None)  # reset baseline
+                    _spoolman_autolink_by_rfid(slot, rfid, st, printer_id)
+
+        # Track cumulative length for per-job Moonraker attribution
+        cur_m = float(mat.get("usedMaterialLength") or 0)
+        st.ws_slot_length_m[slot] = cur_m
 
     for box in boxes:
         if not isinstance(box, dict):
             continue
-        if box.get("type") != 0:
-            continue  # skip spool holders (type 1)
-        box_id = box.get("id")
-        if not isinstance(box_id, int) or box_id < 1 or box_id > 4:
-            continue
-
-        boxes_meta[str(box_id)] = {
-            "connected": True,
-            "temperature_c": float(box["temp"]) if isinstance(box.get("temp"), (int, float)) else None,
-            "humidity_pct": float(box["humidity"]) if isinstance(box.get("humidity"), (int, float)) else None,
-        }
-
-        for mat in (box.get("materials") or []):
-            if not isinstance(mat, dict):
-                continue
-            mat_id = mat.get("id")
-            if not isinstance(mat_id, int) or mat_id < 0 or mat_id > 3:
+        box_type = box.get("type")
+        if box_type == 0:
+            box_id = box.get("id")
+            if not isinstance(box_id, int) or box_id < 1 or box_id > 4:
                 continue
 
-            slot = f"{box_id}{'ABCD'[mat_id]}"
-            if slot not in _VALID_SLOT_IDS:
-                continue
-
-            state_val = int(mat.get("state") or 0)
-            selected = int(mat.get("selected") or 0)
-
-            # state 2 = RFID: WS percent is real sensor data → use it
-            # state 1 = manual: WS always reports 100 (no sensor) → use Spoolman cache
-            # state 0 = empty: no percent
-            if state_val == 2:
-                pct = mat.get("percent")
-            elif state_val == 1:
-                pct = manual_pct.get(slot)  # None until async refresh fills it
-            else:
-                pct = None
-
-            st.cfs_slots[slot] = {
-                "percent": pct,
-                "state": state_val,
-                "rfid": mat.get("rfid", ""),
-                "selected": selected,
-                "present": state_val > 0,
+            boxes_meta[str(box_id)] = {
+                "connected": True,
+                "temperature_c": float(box["temp"]) if isinstance(box.get("temp"), (int, float)) else None,
+                "humidity_pct": float(box["humidity"]) if isinstance(box.get("humidity"), (int, float)) else None,
             }
 
-            if selected == 1:
-                active_slot = slot
+            for mat in (box.get("materials") or []):
+                if not isinstance(mat, dict):
+                    continue
+                mat_id = mat.get("id")
+                if not isinstance(mat_id, int) or mat_id < 0 or mat_id > 3:
+                    continue
 
-            # Update local slot metadata from CFS data (only if spool is physically present)
-            if state_val > 0 and slot in st.slots:
-                slot_obj = st.slots[slot]
-                raw_color = mat.get("color", "")
-                col = _normalize_ws_color(raw_color)
-                if col and len(col) == 7 and col.startswith("#"):
-                    slot_obj.color_hex = col
-                mat_type = (mat.get("type") or "").strip().upper()
-                if mat_type:
-                    slot_obj.material = mat_type  # type: ignore[assignment]
-                name = (mat.get("name") or "").strip()
-                if name:
-                    slot_obj.name = name
-                vendor = (mat.get("vendor") or "").strip()
-                if vendor:
-                    slot_obj.manufacturer = vendor
-                st.slots[slot] = slot_obj
+                slot = f"{box_id}{'ABCD'[mat_id]}"
+                if slot not in _VALID_CFS_SLOT_IDS:
+                    continue
+                _process_material_slot(slot, mat, allow_ssh_serial_lookup=True)
+            continue
 
-            # Detect RFID→non-RFID swap: unlink Spoolman when state drops from 2
-            prev_state = last_state.get(slot, -1)
-            last_state[slot] = state_val
-            if prev_state == 2 and state_val != 2:
-                slot_obj_swap = st.slots.get(slot)
-                if slot_obj_swap and getattr(slot_obj_swap, "spoolman_id", None):
-                    slot_obj_swap.spoolman_id = None
-                    st.slots[slot] = slot_obj_swap
-                    st.ws_slot_length_m.pop(slot, None)
-                    last_rfid.pop(slot, None)
-                    print(f"[CFS] ({printer_id}) Slot {slot}: state {prev_state}→{state_val}, unlinked Spoolman spool (spool swap)")
+        if box_type == 1:
+            # Direct printer spool holder (single input, outside CFS boxes).
+            # Firmware sends this as a dedicated holder with one material entry.
+            mats = box.get("materials") or []
+            first = mats[0] if isinstance(mats, list) and mats and isinstance(mats[0], dict) else {}
+            _process_material_slot(PRINTER_SPOOL_SLOT, first, allow_ssh_serial_lookup=False)
 
-            # SSH fetch for serialNum-based auto-link whenever a slot freshly becomes RFID
-            if state_val == 2 and prev_state != 2:
-                now = time.time()
-                if now - _ssh_last_fetch.get(printer_id, 0.0) > _SSH_FETCH_COOLDOWN:
-                    asyncio.create_task(_ssh_fetch_and_apply(printer_id))
-
-            # RFID-based auto-link: react to any RFID change on this slot
-            rfid = mat.get("rfid", "")
-            if rfid and state_val == 2:  # state 2 = RFID-tagged spool
-                prev_rfid = last_rfid.get(slot, "")
-                if rfid != prev_rfid:
-                    last_rfid[slot] = rfid
-                    slot_obj2 = st.slots.get(slot)
-                    if slot_obj2:
-                        if getattr(slot_obj2, "spoolman_id", None):
-                            # RFID changed on a linked slot — implicit spool swap
-                            slot_obj2.spoolman_id = None
-                            st.slots[slot] = slot_obj2
-                            st.ws_slot_length_m.pop(slot, None)  # reset baseline
-                        _spoolman_autolink_by_rfid(slot, rfid, st, printer_id)
-
-            # Track cumulative length for per-job Moonraker attribution
-            cur_m = float(mat.get("usedMaterialLength") or 0)
-            st.ws_slot_length_m[slot] = cur_m
+    # If the current payload did not include spool-holder data, keep SP visible but mark empty.
+    if PRINTER_SPOOL_SLOT not in seen_slots:
+        st.cfs_slots[PRINTER_SPOOL_SLOT] = {
+            "percent": None,
+            "state": 0,
+            "rfid": "",
+            "selected": 0,
+            "present": False,
+        }
 
     # Store box connection metadata so the frontend can show correct boxes
     if boxes_meta:
@@ -1729,12 +1763,13 @@ def api_health():
 def default_state() -> AppState:
     """Safe defaults if state.json is missing/broken.
 
-    Must always include all 4x4 CFS slots so the UI never crashes, even if the
-    state file is corrupted.
+    Must always include all 4x4 CFS slots and the direct printer spool input so
+    the UI never crashes, even if the state file is corrupted.
     """
     slots: Dict[str, SlotState] = {}
     for sid in DEFAULT_SLOTS:
         slots[sid] = SlotState(slot=sid, material="OTHER", color_hex="#00aaff")
+    slots[PRINTER_SPOOL_SLOT] = SlotState(slot=PRINTER_SPOOL_SLOT, material="OTHER", color_hex="#00aaff")
 
     # Sensible demo defaults for Box 2 (matches the UI screenshot vibe)
     slots["2A"].material = "ABS"
