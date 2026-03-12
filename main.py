@@ -931,7 +931,22 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
 
     def _process_material_slot(slot: str, mat: dict, *, allow_ssh_serial_lookup: bool) -> None:
         nonlocal active_slot
-        state_val = int(mat.get("state") or 0)
+        raw_state_val = int(mat.get("state") or 0)
+        mat_type_raw = str(mat.get("type") or "").strip().upper()
+        name_raw = str(mat.get("name") or "").strip()
+        vendor_raw = str(mat.get("vendor") or "").strip()
+        rfid_raw = str(mat.get("rfid") or "").strip()
+        # Creality's "empty spool" option may come through as manual (state=1)
+        # with a placeholder material and no identifying metadata. Treat that as
+        # truly empty so UI/rendering does not show "OTHER".
+        empty_manual_signature = (
+            raw_state_val == 1
+            and not rfid_raw
+            and not name_raw
+            and not vendor_raw
+            and mat_type_raw in ("", "-", "—", "–", "N/A", "NA", "NONE", "OTHER")
+        )
+        state_val = 0 if empty_manual_signature else raw_state_val
         selected = int(mat.get("selected") or 0)
 
         # state 2 = RFID: use Spoolman-based calc (same behavior as manual slots)
@@ -945,13 +960,13 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
         st.cfs_slots[slot] = {
             "percent": pct,
             "state": state_val,
-            "rfid": mat.get("rfid", ""),
+            "rfid": rfid_raw,
             "selected": selected,
             "present": state_val > 0,
         }
         seen_slots.add(slot)
 
-        if selected == 1:
+        if selected == 1 and state_val > 0:
             active_slot = slot
 
         # Update local slot metadata from WS data (only if a spool is physically present)
