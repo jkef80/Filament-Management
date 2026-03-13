@@ -18,6 +18,24 @@ function fmtTs(ts) {
   }
 }
 
+function fmtDuration(startTs, endTs) {
+  const start = Number(startTs || 0);
+  const end = Number(endTs || 0);
+  if (!(start > 0) || !(end >= start)) return "—";
+  let secs = Math.round(end - start);
+  const days = Math.floor(secs / 86400);
+  secs -= days * 86400;
+  const hours = Math.floor(secs / 3600);
+  secs -= hours * 3600;
+  const mins = Math.floor(secs / 60);
+  secs -= mins * 60;
+
+  if (days > 0) return `${days}d ${hours}h ${mins}m`;
+  if (hours > 0) return `${hours}h ${mins}m`;
+  if (mins > 0) return `${mins}m ${secs}s`;
+  return `${secs}s`;
+}
+
 function badge(el, text, cls) {
   el.classList.remove("ok", "bad", "warn");
   if (cls) el.classList.add(cls);
@@ -1107,7 +1125,7 @@ function renderRecentJobsCard(printers) {
 
     const sub = document.createElement("div");
     sub.className = "moonSub";
-    sub.textContent = `Start: ${fmtTs(j.startedAt)} · End: ${fmtTs(j.endedAt)}`;
+    sub.textContent = `Start: ${fmtTs(j.startedAt)} · End: ${fmtTs(j.endedAt)} · Print Time: ${fmtDuration(j.startedAt, j.endedAt)}`;
     entry.appendChild(sub);
 
     const spoolList = document.createElement("div");
