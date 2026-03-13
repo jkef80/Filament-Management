@@ -711,6 +711,57 @@ def _spoolman_set_extra(spool_id: int, key: str, value: str) -> None:
         print(f"[SPOOLMAN] set extra failed for spool {spool_id}: {e}")
 
 
+def _spoolman_job_color_lookup(spool_id: int) -> str:
+    """Return current filament color for a spool (cached for UI history rendering)."""
+    sid = _spoolman_id_or_none(spool_id)
+    if not sid:
+        return ""
+    now = _now()
+    cached = _spoolman_job_color_cache.get(sid)
+    if cached and (now - cached[0]) <= _SPOOLMAN_JOB_COLOR_CACHE_TTL:
+        return cached[1]
+
+    base = _spoolman_base_url()
+    if not base:
+        return ""
+    try:
+        spool = _spoolman_get_spool(base, sid)
+        filament = spool.get("filament") or {}
+        color = _normalize_color_hex(str(filament.get("color_hex") or ""))
+        _spoolman_job_color_cache[sid] = (now, color)
+        return color
+    except Exception:
+        return ""
+
+
+def _ui_hydrate_job_history_colors(history_in: list) -> list:
+    """Hydrate history spool colors from current linked Spoolman spool metadata."""
+    if not isinstance(history_in, list):
+        return []
+    out: list = []
+    for job in history_in:
+        if not isinstance(job, dict):
+            continue
+        job_out = dict(job)
+        spools_in = job.get("spools") or []
+        spools_out: list = []
+        if isinstance(spools_in, list):
+            for sp in spools_in:
+                if not isinstance(sp, dict):
+                    continue
+                sp_out = dict(sp)
+                sid = _spoolman_id_or_none(sp_out.get("spoolman_id"))
+                color = _spoolman_job_color_lookup(sid or 0) if sid else ""
+                if color:
+                    sp_out["color_hex"] = color
+                else:
+                    sp_out["color_hex"] = _normalize_color_hex(str(sp_out.get("color_hex") or sp_out.get("color") or ""))
+                spools_out.append(sp_out)
+        job_out["spools"] = spools_out
+        out.append(job_out)
+    return out
+
+
 def _spoolman_autolink_by_rfid(slot: str, rfid: str, st, printer_id: str) -> None:
     """Search active Spoolman spools for one with extra.cfs_rfid == rfid and auto-link."""
     base = _spoolman_base_url()
@@ -882,6 +933,8 @@ _ws_seen_keys: Dict[str, set] = {}
 _spoolman_manual_pct: Dict[str, Dict[str, Optional[int]]] = {}  # printer_id → slot → percent or None
 _spoolman_pct_refresh_at: Dict[str, Dict[str, float]] = {}      # printer_id → slot → next refresh timestamp
 _SPOOLMAN_PCT_TTL = 60.0
+_spoolman_job_color_cache: Dict[int, tuple[float, str]] = {}    # spool_id → (ts, "#rrggbb"|"")
+_SPOOLMAN_JOB_COLOR_CACHE_TTL = 30.0
 
 # Known WS key names for printer identity (tried in order)
 _WS_NAME_KEYS = ("hostname", "machineName", "printerName", "deviceName", "model", "MachineModel", "deviceModel")
@@ -1578,6 +1631,7 @@ def _ui_state_dict(state: AppState) -> dict:
     d.setdefault("cfs_slots", {})
     d.setdefault("cfs_stats", {})
     d.setdefault("job_history", [])
+    d["job_history"] = _ui_hydrate_job_history_colors(d["job_history"])
     d["spoolman_configured"] = bool(_spoolman_base_url())
     d["spoolman_url"] = _spoolman_base_url()
 
