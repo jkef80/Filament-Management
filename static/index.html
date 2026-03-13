@@ -55,7 +55,7 @@
     </main>
 
     <!-- cache-bust: force clients to fetch latest app.js after updates -->
-    <script src="/static/app.js?v=20260313-2"></script>
+    <script src="/static/app.js?v=20260313-3"></script>
 
     <!-- Slot / Spool editor (local bookkeeping only; never talks to printer) -->
     <div id="spoolModal" class="modal" style="display:none;">
@@ -88,6 +88,33 @@
           </div>
           <div class="modalStats" id="spoolStats"></div>
           <div class="modalHint">Note: This saves locally in this app only (no POST to printer).</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent jobs spool relink modal -->
+    <div id="historyRelinkModal" class="modal" style="display:none;">
+      <div class="modalBackdrop" id="historyRelinkBackdrop"></div>
+      <div class="modalPanel">
+        <div class="modalHead">
+          <div>
+            <div class="modalTitle" id="historyRelinkTitle">Relink Job Spool</div>
+            <div class="modalSub" id="historyRelinkSub">—</div>
+          </div>
+          <button class="modalClose" id="historyRelinkClose" title="Close">✕</button>
+        </div>
+        <div class="modalBody">
+          <div class="spoolmanSection">
+            <div class="spoolmanHead">
+              <span class="spoolmanTitle">Spoolman</span>
+              <span class="tag muted">Select spool</span>
+            </div>
+            <div class="spoolmanNotLinkedWrap">
+              <div id="historyRelinkSelect" class="spoolmanList"></div>
+              <button id="historyRelinkApply" class="btn">Relink</button>
+            </div>
+          </div>
+          <div id="historyRelinkHint" class="modalHint">Usage will be moved between linked spools for this job entry.</div>
         </div>
       </div>
     </div>
