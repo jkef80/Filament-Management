@@ -6,11 +6,14 @@ import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from urllib.request import Request as UrlRequest, urlopen
-from urllib.parse import urlencode
+from urllib.parse import urlparse
+
+import websockets
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -18,19 +21,17 @@ from models.schemas import (
     ApiResponse,
     AppState,
     FeedRequest,
-    JobSetRequest,
-    JobUpdateRequest,
-    MoonrakerAllocateRequest,
+    JobReallocateSpoolRequest,
+    MultiAppState,
     RetractRequest,
     SelectSlotRequest,
     SetAutoRequest,
     SlotState,
-    SpoolApplyUsageRequest,
-    SpoolResetRequest,
+    SlotStats,
+    SpoolmanLinkRequest,
+    SpoolmanUnlinkRequest,
     UiSetColorRequest,
-    UiSpoolSetRemainingRequest,
     UiSpoolSetStartRequest,
-    UiSlotResetRequest,
     UiSlotUpdateRequest,
     UpdateSlotRequest,
 )
@@ -72,6 +73,7 @@ DEFAULT_SLOTS = [
     "3A", "3B", "3C", "3D",
     "4A", "4B", "4C", "4D",
 ]
+PRINTER_SPOOL_SLOT = "SP"
 
 
 def _now() -> float:
@@ -118,14 +120,14 @@ def _ensure_data_files() -> None:
         CONFIG_PATH.write_text(
             json.dumps(
                 {
-                    # Optional: set this to enable automatic job usage reading from Moonraker
-                    # Example: "http://192.168.178.148:7125"
-                    "moonraker_url": "",
-                    "poll_interval_sec": 5,
+                    # Hostname or IPs of printers (used for WebSocket connection at ws://host:9999)
+                    # Example: ["192.168.178.148", "192.168.178.149"]
+                    "printer_urls": [],
                     # Filament diameter used for mm->g conversion
                     "filament_diameter_mm": 1.75,
-                    # If true, import material/color/name from detected CFS objects into local slots (read-only to printer)
-                    "cfs_autosync": False,
+                    # Optional: Spoolman URL for spool inventory integration
+                    # Example: "http://192.168.178.148:7912"
+                    "spoolman_url": "",
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -133,31 +135,8 @@ def _ensure_data_files() -> None:
         )
 
     if not STATE_PATH.exists():
-        slots: Dict[str, dict] = {}
-        for s in DEFAULT_SLOTS:
-            slots[s] = _model_dump(SlotState(slot=s))
         state = {
-            "active_slot": "2A",
-            "auto_mode": False,
-            "slots": slots,
-            "current_job": "",
-            "current_job_filament_mm": 0,
-            "current_job_filament_g": 0.0,
-            "last_accounted_job_mm": 0,
-            "last_accounted_slot": None,
-            # per-slot usage history (newest first)
-            "slot_history": {},
-            # in-flight job attribution (persisted so a restart doesn't lose the active print)
-            "job_track_name": "",
-            "job_track_started_at": 0.0,
-            "job_track_last_mm": 0,
-            "job_track_slot_mm": {},
-            "job_track_slot_g": {},
-            "job_track_last_state": "",
-            # snapshot from Moonraker history (global list)
-            "moonraker_history": [],
-            # local manual allocations for Moonraker history -> slots
-            "moonraker_allocations": {},
+            "printers": {},
             "updated_at": _now(),
         }
         STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False))
@@ -171,21 +150,148 @@ def load_profiles() -> dict:
         return {}
 
 
+def _normalize_printer_host(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if "://" in raw:
+        host = urlparse(raw).hostname or ""
+        return host.strip() if host else ""
+    # strip path/port if user pasted host:port or host/path
+    host = raw.split("/")[0].strip()
+    if ":" in host:
+        host = host.split(":", 1)[0].strip()
+    return host
+
+
+def _normalize_printer_id(raw_id: str, address: str) -> str:
+    rid = (raw_id or "").strip()
+    if rid:
+        return rid
+    return (address or "").strip()
+
+
+def _dedupe_printers(items: List[str]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for it in items:
+        if not it or it in seen:
+            continue
+        seen.add(it)
+        out.append(it)
+    return out
+
+
 def load_config() -> dict:
     _ensure_data_files()
     try:
-        return json.loads(CONFIG_PATH.read_text())
+        cfg = json.loads(CONFIG_PATH.read_text())
     except Exception:
-        return {
-            "moonraker_url": "",
-            "poll_interval_sec": 5,
-            "filament_diameter_mm": 1.75,
-            "cfs_autosync": False,
-        }
+        cfg = {}
+
+    printer_urls: List[str] = []
+    printers: List[dict] = []
+
+    # Backward compat: migrate legacy printer_url into printer_urls
+    legacy_printer = _normalize_printer_host(cfg.get("printer_url") or "")
+    if legacy_printer:
+        printer_urls.append(legacy_printer)
+
+    # Backward compat: extract hostname from legacy moonraker_url if no printer provided
+    if not printer_urls:
+        mu = (cfg.get("moonraker_url") or "").strip()
+        if mu:
+            host = urlparse(mu).hostname or ""
+            if host:
+                print(f"[CONFIG] Migrating moonraker_url → printer_urls (host={host!r})")
+                printer_urls.append(host)
+
+    # Preferred multi-printer config
+    raw_list = cfg.get("printer_urls")
+    if isinstance(raw_list, list):
+        for raw in raw_list:
+            host = _normalize_printer_host(str(raw))
+            if host:
+                printer_urls.append(host)
+
+    # Backward/alternate compat: "printers": [{"address": "..."}]
+    raw_printers = cfg.get("printers")
+    if isinstance(raw_printers, list):
+        for item in raw_printers:
+            host = ""
+            if isinstance(item, dict):
+                host = (
+                    item.get("address")
+                    or item.get("host")
+                    or item.get("ip")
+                    or item.get("url")
+                    or item.get("printer_url")
+                    or ""
+                )
+            elif isinstance(item, str):
+                host = item
+            host = _normalize_printer_host(str(host))
+            if host:
+                printer_urls.append(host)
+
+    # Backward/alternate compat: "printers": [{"id": "...", "address": "..."}]
+    raw_printers = cfg.get("printers")
+    if isinstance(raw_printers, list):
+        for item in raw_printers:
+            host = ""
+            pid = ""
+            if isinstance(item, dict):
+                host = (
+                    item.get("address")
+                    or item.get("host")
+                    or item.get("ip")
+                    or item.get("url")
+                    or item.get("printer_url")
+                    or ""
+                )
+                pid = (
+                    item.get("id")
+                    or item.get("name")
+                    or item.get("label")
+                    or ""
+                )
+            elif isinstance(item, str):
+                host = item
+            host = _normalize_printer_host(str(host))
+            if not host:
+                continue
+            pid = _normalize_printer_id(str(pid), host)
+            printers.append({"id": pid, "address": host})
+            printer_urls.append(host)
+
+    # Also promote plain printer_urls into printers (id defaults to address)
+    existing_addrs = {str(p.get("address") or "").strip() for p in printers}
+    for host in printer_urls:
+        if host in existing_addrs:
+            continue
+        pid = _normalize_printer_id("", host)
+        printers.append({"id": pid, "address": host})
+
+    # Dedupe by id (keep first)
+    seen_ids = set()
+    printers_out: List[dict] = []
+    for p in printers:
+        pid = str(p.get("id") or "").strip()
+        addr = str(p.get("address") or "").strip()
+        if not pid or not addr or pid in seen_ids:
+            continue
+        seen_ids.add(pid)
+        printers_out.append({"id": pid, "address": addr})
+
+    cfg["printers"] = printers_out
+    cfg["printer_urls"] = _dedupe_printers(printer_urls)
+    cfg.setdefault("filament_diameter_mm", 1.75)
+    cfg.setdefault("spoolman_url", "")
+    return cfg
 
 
-def _migrate_state_dict(data: dict) -> dict:
-    """Make state.json tolerant to older/hand-edited formats."""
+def _migrate_app_state_dict(data: dict) -> dict:
+    """Make a single-printer AppState tolerant to older/hand-edited formats."""
     if not isinstance(data, dict):
         return data
 
@@ -207,13 +313,6 @@ def _migrate_state_dict(data: dict) -> dict:
             except Exception:
                 data["updated_at"] = 0.0
 
-    # Ensure new fields exist
-    data.setdefault("current_job", data.get("job", {}).get("name", ""))
-    data.setdefault("current_job_filament_mm", int(data.get("job", {}).get("used_mm", 0) or 0))
-    data.setdefault("current_job_filament_g", float(data.get("job", {}).get("used_g", 0.0) or 0.0))
-    data.setdefault("last_accounted_job_mm", int(data.get("last_accounted_job_mm", 0) or 0))
-    data.setdefault("last_accounted_slot", data.get("last_accounted_slot"))
-
     # Slots: allow keys like "2A": {material,color,...} without slot field
     slots = data.get("slots", {}) or {}
     if isinstance(slots, dict):
@@ -231,12 +330,8 @@ def _migrate_state_dict(data: dict) -> dict:
             mat = sd.get("material")
             if isinstance(mat, str) and mat.strip() in ("", "-", "—", "–"):
                 sd["material"] = "OTHER"
-            # allow 'remaining_g' as int
-            if "remaining_g" in sd and sd["remaining_g"] is not None:
-                try:
-                    sd["remaining_g"] = float(sd["remaining_g"])
-                except Exception:
-                    sd["remaining_g"] = None
+            # Spoolman integration (optional)
+            sd.setdefault("spoolman_id", None)
             slots[slot_id] = sd
         # ensure all CFS banks exist (1A-4D)
         for sid in (
@@ -252,9 +347,17 @@ def _migrate_state_dict(data: dict) -> dict:
                     "color_hex": "#00aaff",
                     "name": "",
                     "manufacturer": "",
-                    "remaining_g": 0.0,
-                    "notes": "",
                 }
+        # Ensure the printer's direct spool input exists too.
+        if PRINTER_SPOOL_SLOT not in slots:
+            slots[PRINTER_SPOOL_SLOT] = {
+                "slot": PRINTER_SPOOL_SLOT,
+                "material": "OTHER",
+                "color_hex": "#00aaff",
+                "name": "",
+                "manufacturer": "",
+                "spoolman_id": None,
+            }
         data["slots"] = slots
 
     data.setdefault("printer_connected", False)
@@ -264,49 +367,160 @@ def _migrate_state_dict(data: dict) -> dict:
     data.setdefault("cfs_last_update", 0.0)
     data.setdefault("cfs_active_slot", None)
     data.setdefault("cfs_slots", {})
-    data.setdefault("cfs_raw", {})
+    data.setdefault("ws_slot_length_m", {})
+    data.setdefault("cfs_stats", {})
+    data.setdefault("job_history", [])
 
-    # --- history defaults ---
-    data.setdefault("slot_history", {})
-    data.setdefault("job_track_name", "")
-    data.setdefault("job_track_started_at", 0.0)
-    data.setdefault("job_track_last_mm", 0)
-    data.setdefault("job_track_slot_mm", {})
-    data.setdefault("job_track_slot_g", {})
-    data.setdefault("job_track_last_state", "")
-
-    # Moonraker history snapshot
-    data.setdefault("moonraker_history", [])
-    data.setdefault("moonraker_allocations", {})
+    # Clear the stale "2A" schema default — active_slot is now driven by WS only
+    if data.get("active_slot") == "2A":
+        data["active_slot"] = None
 
     return data
 
 
-def load_state() -> AppState:
+def _default_printer_id() -> str:
+    cfg = load_config()
+    printers = cfg.get("printers") or []
+    if printers:
+        return str((printers[0] or {}).get("id") or "")
+    return "printer-1"
+
+
+def _migrate_multi_state_dict(data: dict) -> dict:
+    """Normalize the multi-printer state envelope."""
+    if not isinstance(data, dict):
+        return {"printers": {}, "updated_at": _now()}
+
+    # Already multi-printer
+    if isinstance(data.get("printers"), dict):
+        printers_out: Dict[str, dict] = {}
+        for pid, raw in (data.get("printers") or {}).items():
+            if not isinstance(raw, dict):
+                continue
+            printers_out[str(pid)] = _migrate_app_state_dict(raw)
+        updated_at = data.get("updated_at", _now())
+        if isinstance(updated_at, str):
+            updated_at = _parse_iso_ts(updated_at) or _now()
+        return {
+            "printers": printers_out,
+            "updated_at": updated_at,
+        }
+
+    # Legacy single-printer state
+    if isinstance(data.get("slots"), dict):
+        pid = _default_printer_id()
+        updated_at = data.get("updated_at", _now())
+        if isinstance(updated_at, str):
+            updated_at = _parse_iso_ts(updated_at) or _now()
+        return {
+            "printers": {pid: _migrate_app_state_dict(data)},
+            "updated_at": updated_at,
+        }
+
+    return {"printers": {}, "updated_at": _now()}
+
+
+_state_load_failed: bool = False  # True when last load fell back to default
+
+
+def load_state_all() -> MultiAppState:
+    global _state_load_failed
     _ensure_data_files()
     try:
         data = json.loads(STATE_PATH.read_text())
-        data = _migrate_state_dict(data)
-        return _model_validate(AppState, data)
+        data = _migrate_multi_state_dict(data)
+        result = _model_validate(MultiAppState, data)
+        # Ensure configured printers exist in state
+        cfg_printers = load_config().get("printers") or []
+        for p in cfg_printers:
+            pid = str((p or {}).get("id") or "")
+            if not pid:
+                continue
+            # If state is keyed by address but config now uses a custom id, migrate it.
+            addr = str((p or {}).get("address") or "")
+            if pid not in result.printers and addr in result.printers and addr != pid:
+                result.printers[pid] = result.printers.pop(addr)
+            if pid not in result.printers:
+                result.printers[pid] = default_state()
+        _state_load_failed = False
+        return result
     except Exception as e:
-        # Corrupt/partial state files should never prevent the app from starting.
         print(f"[STATE] load failed: {e}")
-        return default_state()
+        _state_load_failed = True
+        return default_multi_state()
 
 
-def _job_key(job_id: str, ts_end: Optional[float], job: str) -> str:
-    """Build a stable key for a job in our local allocation store."""
-    j = (job_id or "").strip() or (job or "").strip()
-    try:
-        te = float(ts_end) if ts_end is not None else 0.0
-    except Exception:
-        te = 0.0
-    return f"{j}:{te:.0f}"
-
-
-def save_state(state: AppState) -> None:
+def save_state_all(state: MultiAppState) -> None:
+    if _state_load_failed:
+        print("[STATE] save skipped: last load returned fallback default")
+        return
     state.updated_at = _now()
     STATE_PATH.write_text(json.dumps(_model_dump(state), indent=2, ensure_ascii=False))
+
+
+def _all_printer_ids() -> List[str]:
+    cfg_printers = load_config().get("printers") or []
+    cfg_ids = [str((p or {}).get("id") or "") for p in cfg_printers if (p or {}).get("id")]
+    st = load_state_all()
+    state_ids = [str(x) for x in st.printers.keys()]
+    merged: List[str] = []
+    for pid in cfg_ids + state_ids:
+        if pid and pid not in merged:
+            merged.append(pid)
+    return merged
+
+
+def _resolve_printer_id(printer_id: Optional[str], *, allow_unknown: bool = False) -> str:
+    raw = (printer_id or "").strip()
+    cfg_ids = {str((p or {}).get("id") or "").strip() for p in (load_config().get("printers") or [])}
+    if raw and raw in cfg_ids:
+        pid = raw
+    else:
+        pid = _normalize_printer_host(raw)
+    if not pid:
+        pid = _default_printer_id()
+    else:
+        # If caller passed an address, map it to configured id if present
+        for p in (load_config().get("printers") or []):
+            addr = str((p or {}).get("address") or "").strip()
+            cid = str((p or {}).get("id") or "").strip()
+            if addr and cid and pid == addr:
+                pid = cid
+                break
+    if not allow_unknown:
+        known = set(_all_printer_ids())
+        if pid not in known:
+            raise HTTPException(status_code=404, detail="Unknown printer")
+    return pid
+
+
+def _printer_address(printer_id: str) -> str:
+    pid = (printer_id or "").strip()
+    if not pid:
+        return ""
+    for p in (load_config().get("printers") or []):
+        cid = str((p or {}).get("id") or "").strip()
+        addr = str((p or {}).get("address") or "").strip()
+        if cid and addr and cid == pid:
+            return addr
+    # Fallback: treat printer_id as host/IP
+    return _normalize_printer_host(pid)
+
+
+def load_state(printer_id: Optional[str] = None) -> AppState:
+    pid = _resolve_printer_id(printer_id, allow_unknown=True)
+    st = load_state_all()
+    state = st.printers.get(pid)
+    if state is None:
+        return default_state()
+    return state
+
+
+def save_state(printer_id: str, state: AppState) -> None:
+    pid = _resolve_printer_id(printer_id, allow_unknown=True)
+    st = load_state_all()
+    st.printers[pid] = state
+    save_state_all(st)
 
 
 # --- Printer adapter (Dummy) ---
@@ -339,96 +553,6 @@ def mm_to_g(material: str, mm: float) -> float:
     return float(max(0.0, g))
 
 
-def _apply_job_usage(state: AppState, job_name: str, total_used_mm: int, slot_override: Optional[str] = None) -> None:
-    """Update job counters.
-
-    Note: We intentionally do NOT decrement remaining_g here anymore.
-    Creality K2's CFS can change slots mid-print (multi-color). Accurate
-    remaining deduction is handled by the per-slot tracker finalized at
-    print end.
-    """
-    total_used_mm = int(max(0, total_used_mm))
-
-    # Decide which slot to account against
-    slot_id = slot_override or state.last_accounted_slot or state.active_slot
-
-    # If job name changed, reset delta baseline
-    if job_name != (state.current_job or ""):
-        state.last_accounted_job_mm = 0
-
-    delta_mm = max(0, total_used_mm - int(state.last_accounted_job_mm or 0))
-
-    material = state.slots[slot_id].material
-
-    # Update state
-    state.current_job = job_name
-    state.current_job_filament_mm = total_used_mm
-    state.current_job_filament_g = mm_to_g(material, float(total_used_mm))
-    state.last_accounted_job_mm = total_used_mm
-    state.last_accounted_slot = slot_id
-
-
-def _hist_push(state: AppState, slot_id: str, entry: dict, keep: int = 50) -> None:
-    """Append a history entry for a slot (newest first)."""
-    try:
-        # Tag entries with the current spool epoch so UI can hide old-roll prints
-        try:
-            entry.setdefault("epoch", int(getattr(state.slots.get(slot_id), "spool_epoch", 0) or 0))
-        except Exception:
-            entry.setdefault("epoch", 0)
-        h = state.slot_history.get(slot_id)
-        if not isinstance(h, list):
-            h = []
-        h.insert(0, entry)
-        state.slot_history[slot_id] = h[:keep]
-    except Exception:
-        # never fail the poll loop due to history
-        pass
-
-
-def _hist_upsert_by_src(state: AppState, slot_id: str, src: str, entry: dict, keep: int = 50) -> None:
-    """Insert or replace a history entry identified by a stable _src marker.
-
-    Used to show a "live" (in-progress) entry per slot during printing without
-    spamming the history list.
-    """
-    try:
-        if not src:
-            _hist_push(state, slot_id, entry, keep=keep)
-            return
-
-        entry["_src"] = src
-
-        # Tag entries with the current spool epoch so UI can hide old-roll prints
-        try:
-            entry.setdefault("epoch", int(getattr(state.slots.get(slot_id), "spool_epoch", 0) or 0))
-        except Exception:
-            entry.setdefault("epoch", 0)
-
-        h = state.slot_history.get(slot_id)
-        if not isinstance(h, list):
-            h = []
-
-        # Drop existing entries with same source marker
-        h = [e for e in h if not (isinstance(e, dict) and e.get("_src") == src)]
-        h.insert(0, entry)
-        state.slot_history[slot_id] = h[:keep]
-    except Exception:
-        # never fail the poll loop due to history
-        pass
-
-
-def _inc_slot_epoch_consumed(state: AppState, slot_id: str, delta_g: float) -> None:
-    """Increment the running consumed-total for the current spool epoch."""
-    try:
-        s = state.slots.get(slot_id)
-        if not s:
-            return
-        s.spool_epoch_consumed_g_total = float(getattr(s, "spool_epoch_consumed_g_total", 0.0) or 0.0) + float(delta_g)
-        state.slots[slot_id] = s
-    except Exception:
-        return
-
 
 # --- Minimal Moonraker polling (optional) ---
 
@@ -441,569 +565,1002 @@ def _http_get_json(url: str, timeout: float = 2.5) -> dict:
     return json.loads(raw)
 
 
-def _moonraker_fetch_history(base: str, limit: int = 20) -> list[dict]:
-    """Fetch Moonraker job history list (best effort).
-
-    Moonraker provides this at:
-      GET /server/history/list?limit=<n>&order=desc
-    Note: Creality firmware usually exposes the history component, but
-    per-slot attribution is not guaranteed.
-    """
-    try:
-        url = base.rstrip("/") + "/server/history/list?" + urlencode({"limit": int(limit), "order": "desc"})
-        data = _http_get_json(url, timeout=3.5)
-        jobs = (((data or {}).get("result") or {}).get("jobs") or [])
-        out: list[dict] = []
-        for j in jobs:
-            if not isinstance(j, dict):
-                continue
-            fn = j.get("filename") or ""
-            if isinstance(fn, str) and "/" in fn:
-                fn = fn.rsplit("/", 1)[-1]
-            # Moonraker reports filament_used as float; documentation says mm,
-            # however some frontends treat it as meters. We keep both a raw
-            # value and a derived mm estimate.
-            fu = j.get("filament_used")
-            fu_raw = None
-            fu_mm = None
-            try:
-                fu_raw = float(fu)
-                # Heuristic: if the value is small (< 200) it's likely meters.
-                # Otherwise treat it as mm.
-                fu_mm = fu_raw * 1000.0 if fu_raw < 200 else fu_raw
-            except Exception:
-                pass
-
-            meta = j.get("metadata") or {}
-            fu_g_list = None
-            try:
-                lst = meta.get("filament_used_g")
-                if isinstance(lst, list) and lst:
-                    fu_g_list = [float(x) for x in lst]
-            except Exception:
-                fu_g_list = None
-
-            # If firmware didn't provide grams, compute a best-effort estimate from mm + filament_type
-            fu_g_total = None
-            try:
-                if isinstance(fu_g_list, list) and fu_g_list:
-                    fu_g_total = float(sum(fu_g_list))
-                elif fu_mm is not None:
-                    mat = None
-                    if isinstance(meta, dict):
-                        mat = meta.get("filament_type")
-                    mat_s = str(mat).strip().upper() if mat else "OTHER"
-                    fu_g_total = float(mm_to_g(mat_s, float(fu_mm)))
-            except Exception:
-                fu_g_total = None
-
-            out.append(
-                {
-                    "job_id": j.get("job_id") or j.get("uid") or "",
-                    "ts_start": j.get("start_time"),
-                    "ts_end": j.get("end_time"),
-                    "status": j.get("status") or "",
-                    "job": fn,
-                    "filament_used_raw": fu_raw,
-                    "filament_used_mm": fu_mm,
-                    "filament_used_g": fu_g_list,
-                    "filament_used_g_total": (float(round(fu_g_total, 2)) if fu_g_total is not None else None),
-                    "filament_type": (meta.get("filament_type") if isinstance(meta, dict) else None),
-                    "colors": (meta.get("default_filament_colour") if isinstance(meta, dict) else None),
-                }
-            )
-        return out
-    except Exception:
-        return []
-
-def _moonraker_build_url(base: str, objects: list[str]) -> str:
-    """Build Moonraker objects/query URL.
-
-    Moonraker supports multiple syntaxes depending on version/vendor fork.
-    Creality K-series (K2 Plus) reliably supports the ampersand form:
-      /printer/objects/query?print_stats&virtual_sdcard&box&filament_rack
-
-    Some upstream versions also accept `objects=toolhead,print_stats`, but that
-    isn't consistently supported on Creality firmware. For maximum compatibility
-    we use the ampersand form.
-    """
-    safe = [str(o).strip() for o in (objects or []) if str(o).strip()]
-    qs = "&".join(safe)
-    return base.rstrip("/") + "/printer/objects/query?" + qs
+def _http_put_json(url: str, body: dict, timeout: float = 3.0) -> dict:
+    """PUT JSON body and return parsed response (stdlib only)."""
+    data = json.dumps(body).encode("utf-8")
+    req = UrlRequest(url, data=data, headers={
+        "User-Agent": "filament-manager/1.0",
+        "Content-Type": "application/json",
+    }, method="PUT")
+    with urlopen(req, timeout=timeout) as r:
+        raw = r.read().decode("utf-8", errors="replace")
+    return json.loads(raw) if raw.strip() else {}
 
 
-def _moonraker_list_objects(base: str) -> list[str]:
-    data = _http_get_json(base.rstrip("/") + "/printer/objects/list")
-    return list((((data or {}).get("result") or {}).get("objects") or []))
+# --- Spoolman integration (optional) ---
 
-
-def _walk(obj, path=""):
-    # generator over (path, value) for nested dict/list
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            p = f"{path}.{k}" if path else str(k)
-            yield p, v
-            yield from _walk(v, p)
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            p = f"{path}[{i}]"
-            yield p, v
-            yield from _walk(v, p)
-
-
-_SLOT_RE = __import__("re").compile(r"^[1-4][A-D]$")
-
-
-def _extract_cfs_slot_data(status: dict) -> tuple[Optional[str], dict]:
-    """Best-effort extraction of CFS slot metadata from Moonraker status.
-
-    Creality's firmware is not standardized, so we try heuristics:
-    - Any dict key that looks like '1A', '2D', ... is treated as a slot.
-    - Any nested dict with fields like slot/id/index and color/material/name.
-    Returns (active_slot, slots_dict).
-    """
-    active = None
-    slots: dict[str, dict] = {}
-
-    # --- Creality K-series "box" + "filament_rack" objects (K2 Plus / CFS) ---
-    # Firmware exposes:
-    #   box.T1..T4 with arrays: color_value/material_type/remain_len, and box.<Tn>.filament = "A".."D"
-    #   filament_rack.remain_material_color/type
-    # We normalize to internal slot ids: "1A".."4D".
-    try:
-        box = (status or {}).get("box")
-        rack = (status or {}).get("filament_rack")
-        if isinstance(box, dict):
-            # Build lookups from box.same_material: [material_code, color_code, ["T2D"], "ABS"]
-            mat_name_by_code: dict[str, str] = {}
-            sm = box.get("same_material")
-            if isinstance(sm, list):
-                for row in sm:
-                    if not isinstance(row, list) or len(row) < 4:
-                        continue
-                    mcode, _ccode, _slots_list, mname = row[0], row[1], row[2], row[3]
-                    if isinstance(mcode, str) and isinstance(mname, str):
-                        mat_name_by_code[mcode] = mname.strip().upper()
-
-            def _hex_color(creality_val: str) -> Optional[str]:
-                if not isinstance(creality_val, str):
-                    return None
-                v = creality_val.strip().lower()
-                # values look like "0ffa800" or "00a2989"; take last 6 hex chars
-                hex6 = v[-6:]
-                if len(hex6) == 6 and all(ch in "0123456789abcdef" for ch in hex6):
-                    return f"#{hex6}".lower()
-                return None
-
-            boxes: dict[str, dict] = {}
-
-            for ti in ("T1", "T2", "T3", "T4"):
-                t = box.get(ti)
-                if not isinstance(t, dict):
-                    continue
-
-                # Box connection state: "connect" when a CFS is present.
-                bnum = str(ti[1])
-                bstate = str(t.get("state") or "")
-                is_conn = (bstate.lower() == "connect")
-                boxes[bnum] = {
-                    "connected": is_conn,
-                    "state": bstate,
-                    # Best-effort environmental info per CFS box (Creality)
-                    "temperature_c": None,
-                    "humidity_pct": None,
-                }
-
-                # Temperature / humidity are often strings like "32" and "31"
-                try:
-                    tval = t.get("temperature")
-                    hval = t.get("dry_and_humidity")
-                    if tval is not None and str(tval).strip().lower() != "none":
-                        boxes[bnum]["temperature_c"] = float(str(tval).strip())
-                    if hval is not None and str(hval).strip().lower() != "none":
-                        boxes[bnum]["humidity_pct"] = float(str(hval).strip())
-                except Exception:
-                    pass
-
-                # If the box isn't connected, mark its slots as not present and continue.
-                if not is_conn:
-                    for letter in ("A", "B", "C", "D"):
-                        sid = f"{bnum}{letter}"
-                        slots[sid] = {"present": False}
-                    continue
-                colors = t.get("color_value")
-                mats = t.get("material_type")
-                if not (isinstance(colors, list) and isinstance(mats, list)):
-                    continue
-
-                for idx, letter in enumerate(("A", "B", "C", "D")):
-                    sid = f"{ti[1]}{letter}"  # "1A".."4D"
-                    raw_color = colors[idx] if idx < len(colors) else None
-                    raw_mat = mats[idx] if idx < len(mats) else None
-                    out: dict = {"present": True}
-
-                    # Creality uses "-1" to signal an empty slot
-                    if isinstance(raw_mat, str) and raw_mat.strip() == "-1":
-                        slots[sid] = {"present": False, "material": "", "color": ""}
-                        continue
-
-                    col = _hex_color(str(raw_color)) if raw_color is not None else None
-                    if col:
-                        out["color"] = col
-                    if isinstance(raw_mat, str):
-                        out["material"] = mat_name_by_code.get(raw_mat, raw_mat).strip().upper()
-
-                    slots[sid] = out
-
-                fil = t.get("filament")
-                if isinstance(fil, str) and fil in ("A", "B", "C", "D"):
-                    active = f"{ti[1]}{fil}"
-
-            if active is None and isinstance(rack, dict):
-                rc = rack.get("remain_material_color")
-                rt = rack.get("remain_material_type")
-                rc_hex = _hex_color(str(rc)) if rc is not None else None
-                rt_norm = mat_name_by_code.get(rt, rt).strip().upper() if isinstance(rt, str) else None
-                if rc_hex and rt_norm:
-                    for sid, meta in slots.items():
-                        if meta.get("color") == rc_hex and meta.get("material") == rt_norm:
-                            active = sid
-                            break
-
-            if slots:
-                mp = box.get("map")
-                if isinstance(mp, dict):
-                    slots["_map"] = {"raw": mp}
-                # Add box connection metadata for the frontend
-                if boxes:
-                    slots["_boxes"] = boxes
-                return active, slots
-    except Exception:
-        pass
-
-    # 1) Direct keys
-    for k, v in (status or {}).items():
-        if isinstance(k, str) and _SLOT_RE.match(k) and isinstance(v, dict):
-            slots[k] = v
-
-    # 2) Walk nested structures to find slot-like dicts
-    for p, v in _walk(status or {}):
-        if not isinstance(v, dict):
-            continue
-        # Active slot hints
-        for ak in ("active_slot", "current_slot", "slot", "cfs_slot", "ams_slot"):
-            if ak in v and isinstance(v[ak], str) and _SLOT_RE.match(v[ak]):
-                active = v[ak]
-        # Slot dictionaries keyed by slot id
-        if any(key in p.lower() for key in ("cfs", "ams", "mmu", "filament", "spool")):
-            for kk, vv in v.items():
-                if isinstance(kk, str) and _SLOT_RE.match(kk) and isinstance(vv, dict):
-                    slots.setdefault(kk, vv)
-
-    # Normalize fields we care about
-    norm: dict[str, dict] = {}
-    for sid, raw in slots.items():
-        if not isinstance(raw, dict):
-            continue
-        out = {}
-        # presence / loaded flags
-        for pk in ("present", "loaded", "has_filament", "is_loaded", "enabled"):
-            if pk in raw and isinstance(raw[pk], (bool, int)):
-                out["present"] = bool(raw[pk])
-                break
-        # material
-        for mk in ("material", "type", "filament_type"):
-            if mk in raw and isinstance(raw[mk], str):
-                out["material"] = raw[mk].strip().upper()
-                break
-        # color
-        for ck in ("color", "color_hex", "colour", "rgb"):
-            if ck in raw:
-                out["color"] = raw[ck]
-                break
-        # name/vendor
-        for nk in ("name", "label", "spool_name"):
-            if nk in raw and isinstance(raw[nk], str):
-                out["name"] = raw[nk]
-                break
-        for vk in ("vendor", "manufacturer", "brand"):
-            if vk in raw and isinstance(raw[vk], str):
-                out["manufacturer"] = raw[vk]
-                break
-
-        norm[sid] = out or {"raw": raw}
-
-    return active, norm
-
-
-
-
-async def moonraker_poll_loop() -> None:
+def _spoolman_base_url() -> str:
+    """Return the configured Spoolman base URL, or empty string if not set."""
     cfg = load_config()
-    base = (cfg.get("moonraker_url") or "").strip()
+    return (cfg.get("spoolman_url") or "").rstrip("/")
+
+
+def _spoolman_get_spools(base: str) -> list[dict]:
+    """GET /api/v1/spool — return non-archived spools."""
+    url = base + "/api/v1/spool"
+    spools = _http_get_json(url, timeout=5.0)
+    if not isinstance(spools, list):
+        return []
+    return [s for s in spools if not s.get("archived", False)]
+
+
+def _spoolman_get_spool(base: str, spool_id: int) -> dict:
+    """GET /api/v1/spool/{id} — return single spool."""
+    url = f"{base}/api/v1/spool/{spool_id}"
+    return _http_get_json(url, timeout=5.0)
+
+
+def _spoolman_report_usage(spool_id: int, grams: float) -> None:
+    """PUT /api/v1/spool/{id}/use — fire-and-forget."""
+    if not spool_id or grams <= 0:
+        return
+    base = _spoolman_base_url()
     if not base:
         return
-
-    interval = float(cfg.get("poll_interval_sec", 5) or 5)
-    if interval < 1:
-        interval = 1
-
-    # Always query job usage
-    base_objects = ["print_stats", "virtual_sdcard"]
-
-    # Best-effort: discover CFS-related objects once, then include them in polling.
-    cfs_objects: list[str] = []
     try:
-        objs = await asyncio.to_thread(_moonraker_list_objects, base)
-        for o in objs:
-            lo = str(o).lower()
-            if any(x in lo for x in ("cfs", "ams", "mmu", "spool", "filament_box", "filamentbox")):
-                cfs_objects.append(str(o))
-            # Creality K-series / K2 Plus objects
-            if lo in ("box", "filament_rack"):
-                cfs_objects.append(str(o))
-        # Keep the poll URL reasonably short
-        cfs_objects = cfs_objects[:12]
+        url = f"{base}/api/v1/spool/{spool_id}/use"
+        _http_put_json(url, {"use_weight": round(grams, 2)})
+        print(f"[SPOOLMAN] reported usage: spool {spool_id} -= {grams:.2f}g")
+    except Exception as e:
+        print(f"[SPOOLMAN] usage report failed for spool {spool_id}: {e}")
+
+
+def _spoolman_report_measure(spool_id: int, weight_g: float) -> None:
+    """PUT /api/v1/spool/{id} — set remaining_weight directly. Fire-and-forget."""
+    if not spool_id:
+        return
+    base = _spoolman_base_url()
+    if not base:
+        return
+    try:
+        url = f"{base}/api/v1/spool/{spool_id}"
+        data = json.dumps({"remaining_weight": round(weight_g, 2)}).encode("utf-8")
+        req = UrlRequest(url, data=data, headers={
+            "User-Agent": "filament-manager/1.0",
+            "Content-Type": "application/json",
+        }, method="PATCH")
+        with urlopen(req, timeout=3.0) as r:
+            r.read()
+        print(f"[SPOOLMAN] reported measure: spool {spool_id} = {weight_g:.2f}g")
+    except Exception as e:
+        print(f"[SPOOLMAN] measure report failed for spool {spool_id}: {e}")
+
+
+def _spoolman_remaining_weight(spool: dict) -> float:
+    try:
+        return max(0.0, float(spool.get("remaining_weight") or 0.0))
     except Exception:
-        cfs_objects = []
+        return 0.0
 
-    poll_objects = base_objects + cfs_objects
-    url = _moonraker_build_url(base, poll_objects)
 
-    # Optional: if enabled, we import material/color/name from CFS objects into our local slots.
-    cfs_autosync = bool(cfg.get("cfs_autosync", False))
+def _spoolman_set_remaining_weight(base: str, spool_id: int, weight_g: float) -> None:
+    """PATCH /api/v1/spool/{id} with an exact remaining_weight. Raises on failure."""
+    if not spool_id:
+        raise ValueError("Invalid spool ID")
+    url = f"{base}/api/v1/spool/{spool_id}"
+    data = json.dumps({"remaining_weight": round(max(0.0, weight_g), 2)}).encode("utf-8")
+    req = UrlRequest(url, data=data, headers={
+        "User-Agent": "filament-manager/1.0",
+        "Content-Type": "application/json",
+    }, method="PATCH")
+    with urlopen(req, timeout=5.0) as r:
+        r.read()
 
-    # Pull Moonraker's global history occasionally (read-only).
-    last_hist_fetch = 0.0
-    hist_every_sec = 60.0
+
+def _spoolman_id_or_none(value) -> Optional[int]:
+    try:
+        sid = int(value)
+        return sid if sid > 0 else None
+    except Exception:
+        return None
+
+
+def _normalize_color_hex(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if raw.startswith("0x"):
+        raw = raw[2:]
+    if raw.startswith("#"):
+        raw = raw[1:]
+    raw = "".join(ch for ch in raw if ch in "0123456789abcdef")
+    if not raw:
+        return ""
+    # Handle common printer formats:
+    # - 0RRGGBB  -> strip leading 0
+    # - AARRGGBB -> strip alpha
+    # - anything longer -> keep least significant RGB bytes
+    if len(raw) == 7 and raw[0] == "0":
+        raw = raw[1:]
+    elif len(raw) == 8:
+        raw = raw[2:]
+    elif len(raw) > 8:
+        raw = raw[-6:]
+    if len(raw) != 6:
+        return ""
+    return "#" + raw
+
+
+def _spoolman_set_extra(spool_id: int, key: str, value: str) -> None:
+    """PATCH Spoolman spool to write a single extra field. Fire-and-forget."""
+    base = _spoolman_base_url()
+    if not base or not spool_id:
+        return
+    try:
+        url = f"{base}/api/v1/spool/{spool_id}"
+        # Spoolman requires extra field values to be JSON-encoded strings (double-encoded)
+        data = json.dumps({"extra": {key: json.dumps(value)}}).encode("utf-8")
+        req = UrlRequest(url, data=data, headers={
+            "User-Agent": "filament-manager/1.0",
+            "Content-Type": "application/json",
+        }, method="PATCH")
+        with urlopen(req, timeout=3.0) as r:
+            r.read()
+        print(f"[SPOOLMAN] set extra {key}={value!r} on spool {spool_id}")
+    except Exception as e:
+        print(f"[SPOOLMAN] set extra failed for spool {spool_id}: {e}")
+
+
+def _spoolman_job_color_lookup(spool_id: int) -> str:
+    """Return current filament color for a spool (cached for UI history rendering)."""
+    sid = _spoolman_id_or_none(spool_id)
+    if not sid:
+        return ""
+    now = _now()
+    cached = _spoolman_job_color_cache.get(sid)
+    if cached and (now - cached[0]) <= _SPOOLMAN_JOB_COLOR_CACHE_TTL:
+        return cached[1]
+
+    base = _spoolman_base_url()
+    if not base:
+        return ""
+    try:
+        spool = _spoolman_get_spool(base, sid)
+        filament = spool.get("filament") or {}
+        color = _normalize_color_hex(str(filament.get("color_hex") or ""))
+        _spoolman_job_color_cache[sid] = (now, color)
+        return color
+    except Exception:
+        return ""
+
+
+def _ui_hydrate_job_history_colors(history_in: list) -> list:
+    """Hydrate history spool colors from current linked Spoolman spool metadata."""
+    if not isinstance(history_in, list):
+        return []
+    out: list = []
+    for job in history_in:
+        if not isinstance(job, dict):
+            continue
+        job_out = dict(job)
+        spools_in = job.get("spools") or []
+        spools_out: list = []
+        if isinstance(spools_in, list):
+            for sp in spools_in:
+                if not isinstance(sp, dict):
+                    continue
+                sp_out = dict(sp)
+                sid = _spoolman_id_or_none(sp_out.get("spoolman_id"))
+                color = _spoolman_job_color_lookup(sid or 0) if sid else ""
+                if color:
+                    sp_out["color_hex"] = color
+                else:
+                    sp_out["color_hex"] = _normalize_color_hex(str(sp_out.get("color_hex") or sp_out.get("color") or ""))
+                spools_out.append(sp_out)
+        job_out["spools"] = spools_out
+        out.append(job_out)
+    return out
+
+
+def _spoolman_autolink_by_rfid(slot: str, rfid: str, st, printer_id: str) -> None:
+    """Search active Spoolman spools for one with extra.cfs_rfid == rfid and auto-link."""
+    base = _spoolman_base_url()
+    if not base or not rfid:
+        return
+    try:
+        spools = _http_get_json(f"{base}/api/v1/spool?allow_archived=false", timeout=5.0)
+        if not isinstance(spools, list):
+            return
+        for sp in spools:
+            extra = sp.get("extra") or {}
+            raw = extra.get("cfs_rfid", "")
+            # Spoolman stores extra values as JSON-encoded strings — decode before comparing
+            try:
+                stored_rfid = json.loads(raw) if raw else ""
+            except Exception:
+                stored_rfid = raw
+            if stored_rfid != rfid:
+                continue
+            spool_id = sp.get("id")
+            if not spool_id:
+                continue
+            slot_state = st.slots.get(slot)
+            if slot_state is None:
+                return
+            slot_state.spoolman_id = spool_id
+            st.slots[slot] = slot_state
+            # Record RFID as seen so we don't re-trigger next cycle
+            _ws_last_rfid.setdefault(printer_id, {})[slot] = rfid
+            save_state(printer_id, st)
+            print(f"[SPOOLMAN] ({printer_id}) Auto-linked slot {slot} → spool {spool_id} via RFID {rfid!r}")
+            return
+    except Exception as e:
+        print(f"[SPOOLMAN] auto-link lookup failed for slot {slot}: {e}")
+
+
+async def _fetch_printer_material_json(printer_id: str) -> Optional[dict]:
+    """Fetch material_box_info.json from the printer via SSH (system ssh binary)."""
+    host = (_printer_address(printer_id) or "").strip().split(":")[0]
+    if not host:
+        return None
+
+    def _ssh_cat() -> Optional[dict]:
+        import subprocess
+        try:
+            result = subprocess.run(
+                [
+                    "sshpass", "-p", "creality_2023",
+                    "ssh",
+                    "-o", "StrictHostKeyChecking=no",
+                    "-o", "UserKnownHostsFile=/dev/null",
+                    "-o", "ConnectTimeout=5",
+                    f"root@{host}",
+                    "cat /usr/data/creality/userdata/box/material_box_info.json",
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return json.loads(result.stdout)
+            print(f"[SSH] fetch failed ({host}): {result.stderr.strip() or 'no output'}")
+            return None
+        except FileNotFoundError:
+            print("[SSH] sshpass not found; run: apt install sshpass")
+            return None
+        except Exception as e:
+            print(f"[SSH] fetch failed ({host}): {e}")
+            return None
+
+    return await asyncio.get_event_loop().run_in_executor(None, _ssh_cat)
+
+
+def _apply_serialnum_links(info: dict, printer_id: str) -> None:
+    """Parse material_box_info.json; link slots whose serialNum is a valid Spoolman spool ID."""
+    base = _spoolman_base_url()
+    st = load_state(printer_id)
+    changed = False
+
+    for box in (info.get("Material", {}).get("info") or []):
+        box_id_str = box.get("boxID", "")   # "T1" .. "T4"
+        if not box_id_str.startswith("T"):
+            continue
+        box_num = box_id_str[1:]
+
+        for mat in (box.get("list") or []):
+            mat_id = mat.get("materialId", "")   # "A" .. "D"
+            slot = f"{box_num}{mat_id}"
+            if slot not in _VALID_CFS_SLOT_IDS:
+                continue
+
+            serial = (mat.get("serialNum") or "").strip()
+            if not serial or serial == "000000":
+                continue
+            try:
+                spool_id = int(serial)
+            except ValueError:
+                continue
+            if spool_id <= 0:
+                continue
+
+            slot_obj = st.slots.get(slot)
+            if slot_obj and getattr(slot_obj, "spoolman_id", None) == spool_id:
+                continue  # already linked
+
+            if base:
+                try:
+                    spool = _http_get_json(f"{base}/api/v1/spool/{spool_id}", timeout=5.0)
+                    if not isinstance(spool, dict) or not spool.get("id"):
+                        print(f"[SSH] Slot {slot}: serialNum {serial!r} → spool {spool_id} not in Spoolman")
+                        continue
+                except Exception as e:
+                    print(f"[SSH] Slot {slot}: Spoolman lookup failed for spool {spool_id}: {e}")
+                    continue
+
+            if slot_obj is None:
+                slot_obj = SlotState(slot=slot)
+            slot_obj.spoolman_id = spool_id
+            st.slots[slot] = slot_obj
+            changed = True
+            print(f"[SSH] Slot {slot}: linked → Spoolman spool {spool_id} via serialNum {serial!r}")
+
+    if changed:
+        save_state(printer_id, st)
+
+
+async def _ssh_fetch_and_apply(printer_id: str) -> None:
+    """Fetch material_box_info.json via SSH and apply serialNum-based auto-links."""
+    _ssh_last_fetch[printer_id] = time.time()
+    info = await _fetch_printer_material_json(printer_id)
+    if info:
+        _apply_serialnum_links(info, printer_id)
+
+
+def _color_distance(hex1: str, hex2: str) -> float:
+    """Simple Euclidean RGB distance between two hex colors."""
+    try:
+        h1 = hex1.lstrip("#")
+        h2 = hex2.lstrip("#")
+        r1, g1, b1 = int(h1[0:2], 16), int(h1[2:4], 16), int(h1[4:6], 16)
+        r2, g2, b2 = int(h2[0:2], 16), int(h2[2:4], 16), int(h2[4:6], 16)
+        return math.sqrt((r1 - r2) ** 2 + (g1 - g2) ** 2 + (b1 - b2) ** 2)
+    except Exception:
+        return 999.0
+
+
+_WS_SAVE_INTERVAL = 10.0
+_ws_last_save: Dict[str, float] = {}
+_ws_last_rfid: Dict[str, Dict[str, str]] = {}   # printer_id → slot → RFID
+_ws_last_state: Dict[str, Dict[str, int]] = {}  # printer_id → slot → CFS state (0/1/2)
+_ws_last_fingerprint: Dict[str, Dict[str, str]] = {}  # printer_id → slot → material fingerprint
+
+_SSH_FETCH_COOLDOWN = 30.0  # seconds between SSH fetches of material_box_info.json
+_ssh_last_fetch: Dict[str, float] = {}
+
+_moon_last_state: Dict[str, str] = {}        # printer_id → last known print_stats.state
+_moon_last_filament_mm: Dict[str, float] = {}                   # printer_id → filament_used at last poll tick
+_moon_job_track_slot_g: Dict[str, Dict[str, float]] = {}         # printer_id → slot → grams
+_moon_job_track_slot_mm: Dict[str, Dict[str, float]] = {}        # printer_id → slot → mm
+_moon_job_started_at: Dict[str, float] = {}                       # printer_id → Unix timestamp
+_moon_job_name: Dict[str, str] = {}                               # printer_id → filename/job name
+
+_VALID_CFS_SLOT_IDS = frozenset(
+    f"{b}{l}" for b in "1234" for l in "ABCD"
+)
+
+# Log unknown WS message top-level keys once per session to aid discovery
+_ws_seen_keys: Dict[str, set] = {}
+
+# Spoolman-derived percent cache for manual (non-RFID) slots
+_spoolman_manual_pct: Dict[str, Dict[str, Optional[int]]] = {}  # printer_id → slot → percent or None
+_spoolman_pct_refresh_at: Dict[str, Dict[str, float]] = {}      # printer_id → slot → next refresh timestamp
+_SPOOLMAN_PCT_TTL = 60.0
+_spoolman_job_color_cache: Dict[int, tuple[float, str]] = {}    # spool_id → (ts, "#rrggbb"|"")
+_SPOOLMAN_JOB_COLOR_CACHE_TTL = 30.0
+
+# Known WS key names for printer identity (tried in order)
+_WS_NAME_KEYS = ("hostname", "machineName", "printerName", "deviceName", "model", "MachineModel", "deviceModel")
+_WS_FW_KEYS   = ("softVersion", "firmwareVersion", "version", "FirmwareVersion", "SoftwareVersion", "firmware")
+
+
+def _printer_ws_url(printer_id: str) -> str:
+    host = _printer_address(printer_id)
+    if not host:
+        return ""
+    return f"ws://{host.split(':')[0]}:9999"
+
+
+def _moonraker_base_url(printer_id: str) -> str:
+    """Return the Moonraker HTTP base URL (port 7125), or empty string if not configured."""
+    cfg = load_config()
+    mu = (cfg.get("moonraker_url") or "").strip()
+    if mu:
+        parsed = urlparse(mu)
+        host = parsed.hostname or ""
+        port = parsed.port or 7125
+        cfg_ids = [str((p or {}).get("id") or "") for p in (cfg.get("printers") or [])]
+        if len(cfg_ids) <= 1 or host == _printer_address(printer_id):
+            return f"http://{host}:{port}"
+    host = (_printer_address(printer_id) or "").split(":")[0]
+    return f"http://{host}:7125" if host else ""
+
+
+def _normalize_ws_color(raw: str) -> str:
+    """Normalize printer color payloads to '#rrggbb'."""
+    return _normalize_color_hex(raw)
+
+
+def _parse_ws_printer_info(payload: dict, printer_id: str) -> None:
+    """Extract printer name / firmware from any WS status message and persist to state.
+
+    Also logs any previously-unseen top-level keys once per session so we can
+    discover the exact field names the printer uses.
+    """
+    seen = _ws_seen_keys.setdefault(printer_id, set())
+    new_keys = set(payload.keys()) - seen
+    if new_keys:
+        seen |= new_keys
+        _ws_seen_keys[printer_id] = seen
+        print(f"[WS] ({printer_id}) New message keys: {sorted(new_keys)}")
+
+    name = ""
+    for k in _WS_NAME_KEYS:
+        v = str(payload.get(k) or "").strip()
+        if v:
+            name = v
+            break
+
+    fw = ""
+    for k in _WS_FW_KEYS:
+        v = str(payload.get(k) or "").strip()
+        if v:
+            fw = v
+            break
+    # Parse "modelVersion" field: "printer hw ver:;printer sw ver:;DWIN sw ver:1.1.3.13;"
+    if not fw:
+        mv = str(payload.get("modelVersion") or "").strip()
+        if mv:
+            for part in mv.split(";"):
+                part = part.strip()
+                if "sw ver:" in part.lower() and ":" in part:
+                    ver = part.split(":", 1)[1].strip()
+                    if ver:
+                        fw = ver
+                        break
+
+    if not name and not fw:
+        return
+
+    st = load_state(printer_id)
+    changed = False
+    if name and name != st.printer_name:
+        st.printer_name = name
+        changed = True
+        print(f"[WS] ({printer_id}) Printer name: {name!r}")
+    if fw and fw != st.printer_firmware:
+        st.printer_firmware = fw
+        changed = True
+        print(f"[WS] ({printer_id}) Firmware: {fw!r}")
+    if changed:
+        save_state(printer_id, st)
+
+
+def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
+    """Parse a boxsInfo WS payload and update local state + Spoolman."""
+    try:
+        boxes = (payload.get("boxsInfo") or {}).get("materialBoxs") or []
+    except Exception:
+        return
+
+    st = load_state(printer_id)
+    last_rfid = _ws_last_rfid.setdefault(printer_id, {})
+    last_state = _ws_last_state.setdefault(printer_id, {})
+    last_fingerprint = _ws_last_fingerprint.setdefault(printer_id, {})
+    manual_pct = _spoolman_manual_pct.setdefault(printer_id, {})
+    active_slot: Optional[str] = None
+    boxes_meta: dict = {}
+    seen_slots: set[str] = set()
+
+    def _process_material_slot(slot: str, mat: dict, *, allow_ssh_serial_lookup: bool) -> None:
+        nonlocal active_slot
+        raw_state_val = int(mat.get("state") or 0)
+        mat_type_raw = str(mat.get("type") or "").strip().upper()
+        name_raw = str(mat.get("name") or "").strip()
+        vendor_raw = str(mat.get("vendor") or "").strip()
+        rfid_raw = str(mat.get("rfid") or "").strip()
+        raw_color = mat.get("color", "")
+        color_norm = _normalize_ws_color(raw_color)
+        slot_fingerprint = "|".join([mat_type_raw, name_raw, vendor_raw, (color_norm or "").lower()])
+        rfid_missing = rfid_raw in ("", "0", "00", "000", "0000", "00000", "000000")
+        # Creality's "empty spool" option may come through as manual (state=1)
+        # with a placeholder material and no identifying metadata. Treat that as
+        # truly empty so UI/rendering does not show "OTHER".
+        empty_manual_signature = (
+            raw_state_val == 1
+            and rfid_missing
+            and not name_raw
+            and not vendor_raw
+            and mat_type_raw in ("", "-", "—", "–", "N/A", "NA", "NONE", "OTHER")
+        )
+        state_val = 0 if empty_manual_signature else raw_state_val
+        selected = int(mat.get("selected") or 0)
+
+        # state 2 = RFID: use Spoolman-based calc (same behavior as manual slots)
+        # state 1 = manual: WS always reports 100 (no sensor) → use Spoolman cache
+        # state 0 = empty: no percent
+        if state_val in (1, 2):
+            pct = manual_pct.get(slot)  # None until async refresh fills it
+        else:
+            pct = None
+
+        st.cfs_slots[slot] = {
+            "percent": pct,
+            "state": state_val,
+            "rfid": rfid_raw,
+            "selected": selected,
+            "present": state_val > 0,
+            "material": mat_type_raw if state_val > 0 else "",
+            "color": _normalize_color_hex(color_norm) if state_val > 0 else "",
+            "name": name_raw if state_val > 0 else "",
+            "manufacturer": vendor_raw if state_val > 0 else "",
+        }
+        seen_slots.add(slot)
+
+        if selected == 1 and state_val > 0:
+            active_slot = slot
+
+        # Update local slot metadata from WS data (only if a spool is physically present)
+        if state_val > 0 and slot in st.slots:
+            slot_obj = st.slots[slot]
+            if color_norm and len(color_norm) == 7 and color_norm.startswith("#"):
+                slot_obj.color_hex = color_norm
+            mat_type = (mat.get("type") or "").strip().upper()
+            if mat_type:
+                slot_obj.material = mat_type  # type: ignore[assignment]
+            name = (mat.get("name") or "").strip()
+            if name:
+                slot_obj.name = name
+            vendor = (mat.get("vendor") or "").strip()
+            if vendor:
+                slot_obj.manufacturer = vendor
+            st.slots[slot] = slot_obj
+
+        def _clear_slot_link(reason: str) -> None:
+            slot_obj_swap = st.slots.get(slot)
+            if slot_obj_swap and getattr(slot_obj_swap, "spoolman_id", None):
+                slot_obj_swap.spoolman_id = None
+                st.slots[slot] = slot_obj_swap
+                st.ws_slot_length_m.pop(slot, None)
+                last_rfid.pop(slot, None)
+                print(f"[CFS] ({printer_id}) Slot {slot}: {reason}, unlinked Spoolman spool")
+
+        # Detect spool removal/swap and unlink Spoolman.
+        prev_state = last_state.get(slot, -1)
+        last_state[slot] = state_val
+        removed_or_swapped = (prev_state == 2 and state_val != 2) or (prev_state > 0 and state_val == 0)
+        if removed_or_swapped:
+            _clear_slot_link(f"state {prev_state}→{state_val}")
+
+        # Detect manual filament metadata changes while state stays loaded.
+        if state_val > 0:
+            prev_fp = last_fingerprint.get(slot, "")
+            if prev_fp and slot_fingerprint and prev_fp != slot_fingerprint:
+                _clear_slot_link("filament metadata changed")
+            if slot_fingerprint:
+                last_fingerprint[slot] = slot_fingerprint
+        else:
+            last_fingerprint.pop(slot, None)
+
+        # SSH serialNum-based auto-link is only available for CFS slots.
+        if allow_ssh_serial_lookup and state_val == 2 and prev_state != 2:
+            now = time.time()
+            if now - _ssh_last_fetch.get(printer_id, 0.0) > _SSH_FETCH_COOLDOWN:
+                asyncio.create_task(_ssh_fetch_and_apply(printer_id))
+
+        # RFID-based auto-link: react to any RFID change on this slot
+        rfid = mat.get("rfid", "")
+        if rfid and state_val == 2:  # state 2 = RFID-tagged spool
+            prev_rfid = last_rfid.get(slot, "")
+            if rfid != prev_rfid:
+                last_rfid[slot] = rfid
+                slot_obj2 = st.slots.get(slot)
+                if slot_obj2:
+                    if getattr(slot_obj2, "spoolman_id", None):
+                        # RFID changed on a linked slot — implicit spool swap
+                        slot_obj2.spoolman_id = None
+                        st.slots[slot] = slot_obj2
+                        st.ws_slot_length_m.pop(slot, None)  # reset baseline
+                    _spoolman_autolink_by_rfid(slot, rfid, st, printer_id)
+
+        # Track cumulative length for per-job Moonraker attribution
+        cur_m = float(mat.get("usedMaterialLength") or 0)
+        st.ws_slot_length_m[slot] = cur_m
+
+    for box in boxes:
+        if not isinstance(box, dict):
+            continue
+        box_type = box.get("type")
+        if box_type == 0:
+            box_id = box.get("id")
+            if not isinstance(box_id, int) or box_id < 1 or box_id > 4:
+                continue
+
+            boxes_meta[str(box_id)] = {
+                "connected": True,
+                "temperature_c": float(box["temp"]) if isinstance(box.get("temp"), (int, float)) else None,
+                "humidity_pct": float(box["humidity"]) if isinstance(box.get("humidity"), (int, float)) else None,
+            }
+
+            for mat in (box.get("materials") or []):
+                if not isinstance(mat, dict):
+                    continue
+                mat_id = mat.get("id")
+                if not isinstance(mat_id, int) or mat_id < 0 or mat_id > 3:
+                    continue
+
+                slot = f"{box_id}{'ABCD'[mat_id]}"
+                if slot not in _VALID_CFS_SLOT_IDS:
+                    continue
+                _process_material_slot(slot, mat, allow_ssh_serial_lookup=True)
+            continue
+
+        if box_type == 1:
+            # Direct printer spool holder (single input, outside CFS boxes).
+            # Firmware sends this as a dedicated holder with one material entry.
+            mats = box.get("materials") or []
+            first = mats[0] if isinstance(mats, list) and mats and isinstance(mats[0], dict) else {}
+            _process_material_slot(PRINTER_SPOOL_SLOT, first, allow_ssh_serial_lookup=False)
+
+    # If the current payload did not include spool-holder data, keep SP visible but mark empty.
+    if PRINTER_SPOOL_SLOT not in seen_slots:
+        st.cfs_slots[PRINTER_SPOOL_SLOT] = {
+            "percent": None,
+            "state": 0,
+            "rfid": "",
+            "selected": 0,
+            "present": False,
+            "material": "",
+            "color": "",
+            "name": "",
+            "manufacturer": "",
+        }
+
+    # Store box connection metadata so the frontend can show correct boxes.
+    # If no CFS boxes are present, clear stale metadata.
+    if boxes_meta:
+        st.cfs_slots["_boxes"] = boxes_meta
+    else:
+        st.cfs_slots.pop("_boxes", None)
+
+    # Always update active slot — clears stale value when printer is idle
+    st.cfs_active_slot = active_slot
+    if active_slot and active_slot in st.slots:
+        st.active_slot = active_slot
+
+    # Direct spool holder (SP) is not a CFS. Only mark connected when at least
+    # one CFS box (type 0) is present in the current payload.
+    st.cfs_connected = bool(boxes_meta)
+    st.cfs_last_update = _now()
+    st.printer_connected = True
+    st.printer_last_error = ""
+
+    now = _now()
+    if now - _ws_last_save.get(printer_id, 0.0) >= _WS_SAVE_INTERVAL:
+        save_state(printer_id, st)
+        _ws_last_save[printer_id] = now
+
+
+async def _refresh_manual_slot_pcts(printer_id: str) -> None:
+    """Calculate Spoolman-based percent for all linked slots (manual and RFID) and cache it.
+
+    Called after each boxsInfo parse. Uses a per-slot TTL so Spoolman is queried
+    at most once per _SPOOLMAN_PCT_TTL seconds per slot.
+    """
+    base = _spoolman_base_url()
+    if not base:
+        return
+    st = load_state(printer_id)
+    now = _now()
+    loop = asyncio.get_running_loop()
+    manual_pct = _spoolman_manual_pct.setdefault(printer_id, {})
+    pct_refresh = _spoolman_pct_refresh_at.setdefault(printer_id, {})
+
+    for slot, cfs_meta in list(st.cfs_slots.items()):
+        if not isinstance(cfs_meta, dict) or cfs_meta.get("state") not in (1, 2):
+            continue
+        slot_obj = st.slots.get(slot)
+        spool_id = getattr(slot_obj, "spoolman_id", None) if slot_obj else None
+        if not spool_id:
+            manual_pct.pop(slot, None)
+            continue
+        if pct_refresh.get(slot, 0) > now:
+            continue  # still fresh
+
+        try:
+            sp = await loop.run_in_executor(None, _spoolman_get_spool, base, spool_id)
+            filament = sp.get("filament") or {}
+            nominal_g = float(filament.get("weight") or 0)
+            remaining_g = float(sp.get("remaining_weight") or 0)
+            used_g = float(sp.get("used_weight") or 0)
+            if nominal_g > 0:
+                pct: Optional[int] = max(0, min(100, int(round(remaining_g / nominal_g * 100))))
+            elif remaining_g + used_g > 0:
+                pct = max(0, min(100, int(round(remaining_g / (remaining_g + used_g) * 100))))
+            else:
+                pct = None
+            manual_pct[slot] = pct
+            pct_refresh[slot] = now + _SPOOLMAN_PCT_TTL
+            state_label = "RFID" if cfs_meta.get("state") == 2 else "manual"
+            print(f"[SPOOLMAN] ({printer_id}) Slot {slot} {state_label} percent: {pct}%")
+        except Exception:
+            pct_refresh[slot] = now + 10.0  # back off on error
+
+
+async def _ws_connect_and_run(ws_url: str, printer_id: str) -> None:
+    """Open one WebSocket connection to the printer and run the polling loop."""
+    async with websockets.connect(ws_url, ping_interval=None, ping_timeout=None) as ws:
+        # Consume the very first burst (max 5 messages, 0.15 s each).
+        # Parse for printer identity (hostname/modelVersion) but skip CFS data,
+        # which may be stale at this point.
+        for _ in range(5):
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=0.15)
+                try:
+                    _parse_ws_printer_info(json.loads(msg), printer_id)
+                except Exception:
+                    pass
+            except asyncio.TimeoutError:
+                break
+
+        # Heartbeat handshake. The printer may push status frames before "ok",
+        # so scan up to 10 messages instead of assuming the very next one is the ack.
+        await ws.send(json.dumps({"ModeCode": "heart_beat"}))
+        for _ in range(10):
+            try:
+                reply = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                if str(reply).strip() == "ok":
+                    break
+            except asyncio.TimeoutError:
+                break
+
+        st = load_state(printer_id)
+        st.printer_connected = True
+        st.printer_last_error = ""
+        save_state(printer_id, st)
+        print(f"[WS] ({printer_id}) Connected to {ws_url}")
+
+        # Request initial CFS data immediately after handshake
+        await ws.send(json.dumps({"method": "get", "params": {"boxsInfo": 1}}))
+        _last_request: float = asyncio.get_event_loop().time()
+
+        # Continuous message loop — process everything the printer sends.
+        # Never assume the next recv() is the response to our request; the printer
+        # pushes status frames continuously between our request and its reply.
+        while True:
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=6.0)
+            except asyncio.TimeoutError:
+                # Printer went silent — re-request and wait again
+                await ws.send(json.dumps({"method": "get", "params": {"boxsInfo": 1}}))
+                _last_request = asyncio.get_event_loop().time()
+                continue
+
+            # Printer heartbeat ping — ack it immediately
+            if isinstance(msg, str) and "heart_beat" in msg:
+                await ws.send("ok")
+                continue
+
+            # Plain "ok" is the printer acking our heartbeat — nothing to do
+            if isinstance(msg, str) and msg.strip() == "ok":
+                continue
+
+            try:
+                data = json.loads(msg)
+                _parse_ws_printer_info(data, printer_id)
+                if "boxsInfo" in data:
+                    _parse_ws_cfs_data(data, printer_id)
+                    asyncio.create_task(_refresh_manual_slot_pcts(printer_id))
+            except Exception:
+                pass
+
+            # Re-request every 5 s so we keep receiving fresh pushes
+            now = asyncio.get_event_loop().time()
+            if now - _last_request >= 5.0:
+                await ws.send(json.dumps({"method": "get", "params": {"boxsInfo": 1}}))
+                _last_request = now
+
+
+async def printer_ws_loop(printer_id: str) -> None:
+    """Outer reconnect loop for the printer WebSocket connection."""
+    ws_url = _printer_ws_url(printer_id)
+    if not ws_url:
+        print(f"[WS] ({printer_id}) No printer ID configured — WebSocket loop not started.")
+        return
+
+    print(f"[WS] ({printer_id}) Starting WebSocket loop for {ws_url}")
+    backoff = 2.0
 
     while True:
+        last_err = ""
         try:
-            data = await asyncio.to_thread(_http_get_json, url)
-            status = (((data or {}).get("result") or {}).get("status") or {})
-            ps = status.get("print_stats") or {}
-            vsd = status.get("virtual_sdcard") or {}
-
-            ps_state = str(ps.get("state") or "").lower()
-
-            filename = ps.get("filename") or vsd.get("file_path") or ""
-            if isinstance(filename, str) and "/" in filename:
-                filename = filename.rsplit("/", 1)[-1]
-            used = ps.get("filament_used")
-            if used is None:
-                used_mm = 0
-            else:
-                used_mm = int(float(used))
-
-            used_g = 0.0
-            try:
-                meta = ((vsd.get("cur_print_data") or {}).get("metadata") or {})
-                lst = meta.get("filament_used_g")
-                if isinstance(lst, list) and lst:
-                    used_g = float(sum(float(x) for x in lst if x is not None))
-            except Exception:
-                used_g = 0.0
-
-            st = load_state()
-            st.printer_connected = True
-            st.printer_last_error = ""
-
-            # --- CFS read-only extraction (best effort) ---
-            cfs_status = {k: v for k, v in (status or {}).items() if k not in ("print_stats", "virtual_sdcard")}
-            if cfs_status:
-                active_slot, slots_meta = _extract_cfs_slot_data(cfs_status)
-                st.cfs_connected = True
-                st.cfs_last_update = _now()
-                st.cfs_active_slot = active_slot
-                st.cfs_slots = slots_meta
-                # store a small raw snapshot for debugging in the UI
-                st.cfs_raw = {k: cfs_status[k] for k in list(cfs_status)[:4]}
-
-                # If the printer reports an active slot, we can reflect it locally (no POST to printer)
-                if active_slot and active_slot in st.slots:
-                    st.active_slot = active_slot
-
-                # Optional: import metadata into local slots (still read-only to printer)
-                if cfs_autosync and slots_meta:
-                    for sid, meta in slots_meta.items():
-                        if sid not in st.slots:
-                            continue
-                        s = st.slots[sid]
-                        mat = meta.get("material")
-                        if isinstance(mat, str) and mat.strip():
-                            # unknown material will be normalized to OTHER by schema
-                            s.material = mat.strip().upper()  # type: ignore
-                        col = meta.get("color")
-                        if isinstance(col, str) and col.startswith("#") and len(col) == 7:
-                            s.color_hex = col.lower()
-                        name = meta.get("name")
-                        if isinstance(name, str):
-                            s.name = name
-                        mfg = meta.get("manufacturer")
-                        if isinstance(mfg, str):
-                            s.manufacturer = mfg
-                        st.slots[sid] = s
-            else:
-                st.cfs_connected = False
-
-            # --- Per-slot history tracking (read-only) ---
-            # Attribute delta filament_used(mm) to the currently active slot during a print.
-            # This enables per-slot history (and later accurate remaining_g calculations) even
-            # for multi-color prints.
-            try:
-                is_printing = ps_state in ("printing", "paused")
-                tracking = bool(st.job_track_name)
-                curr_slot = (st.cfs_active_slot or st.active_slot or "").strip()
-
-                # Start tracking when a print begins
-                if is_printing and filename:
-                    if (not tracking) or (st.job_track_name != filename):
-                        st.job_track_name = filename
-                        st.job_track_started_at = _now()
-                        st.job_track_last_mm = 0
-                        st.job_track_slot_mm = {}
-                        st.job_track_slot_g = {}
-                        st.job_track_last_state = ps_state
-
-                    # Attribute delta to current slot
-                    last_mm = int(st.job_track_last_mm or 0)
-                    delta_mm = max(0, int(used_mm) - last_mm)
-                    if delta_mm > 0 and curr_slot:
-                        st.job_track_slot_mm[curr_slot] = int(st.job_track_slot_mm.get(curr_slot, 0)) + int(delta_mm)
-
-                        # Convert delta_mm to grams for this slot's material and track it
-                        try:
-                            mat = st.slots.get(curr_slot).material if curr_slot in st.slots else "OTHER"
-                            g_delta = float(mm_to_g(str(mat), float(delta_mm)))
-                        except Exception:
-                            g_delta = 0.0
-                        if g_delta > 0:
-                            st.job_track_slot_g[curr_slot] = float(st.job_track_slot_g.get(curr_slot, 0.0)) + float(g_delta)
-
-                            # Live spool deduction: increment epoch-consumed total immediately
-                            _inc_slot_epoch_consumed(st, curr_slot, float(g_delta))
-                    st.job_track_last_mm = int(used_mm)
-                    st.job_track_last_state = ps_state
-
-                    # Publish a single "live" history entry per slot for the current job.
-                    # This makes the right-hand "Historie pro Slot" useful during
-                    # multi-color prints (usage is attributed while printing, not only at the end).
-                    try:
-                        now_ts = _now()
-                        slot_mm_live = st.job_track_slot_mm if isinstance(st.job_track_slot_mm, dict) else {}
-                        for sid, mm_live in slot_mm_live.items():
-                            try:
-                                mm_i = int(mm_live or 0)
-                                if mm_i <= 0:
-                                    continue
-                                mat = st.slots.get(sid).material if sid in st.slots else "OTHER"
-                                g_live = float(round(mm_to_g(str(mat), float(mm_i)), 2))
-                                src = f"live:{st.job_track_started_at}:{st.job_track_name}:{sid}"
-                                _hist_upsert_by_src(
-                                    st,
-                                    sid,
-                                    src,
-                                    {
-                                        "ts": float(now_ts),
-                                        "job": st.job_track_name,
-                                        "used_mm": mm_i,
-                                        "used_g": g_live,
-                                        "result": "printing",
-                                    },
-                                )
-                            except Exception:
-                                continue
-                    except Exception:
-                        pass
-
-                # Finalize when printing ends (complete/cancel/error/standby)
-                if (not is_printing) and tracking and st.job_track_name:
-                    # Determine an end timestamp from Creality virtual_sdcard if available
-                    end_ts = _now()
-                    try:
-                        cpd = (vsd.get("cur_print_data") or {})
-                        et = cpd.get("end_time")
-                        if et is not None:
-                            end_ts = float(et)
-                    except Exception:
-                        pass
-
-                    # Create history entries per slot (only if we have consumption)
-                    slot_mm = st.job_track_slot_mm if isinstance(st.job_track_slot_mm, dict) else {}
-                    for sid, mm in slot_mm.items():
-                        try:
-                            mm_i = int(mm)
-                            if mm_i <= 0:
-                                continue
-                            mat = st.slots.get(sid).material if sid in st.slots else "OTHER"
-                            g = float(round(mm_to_g(str(mat), float(mm_i)), 2))
-
-                            # Remove any live entry for this job/slot (so we don't show duplicates)
-                            try:
-                                live_src = f"live:{st.job_track_started_at}:{st.job_track_name}:{sid}"
-                                h0 = st.slot_history.get(sid)
-                                if isinstance(h0, list):
-                                    st.slot_history[sid] = [e for e in h0 if not (isinstance(e, dict) and e.get("_src") == live_src)]
-                            except Exception:
-                                pass
-
-                            _hist_push(
-                                st,
-                                sid,
-                                {
-                                    "ts": float(end_ts),
-                                    "job": st.job_track_name,
-                                    "used_mm": mm_i,
-                                    "used_g": g,
-                                    "result": ps_state,
-                                },
-                            )
-                        except Exception:
-                            continue
-
-                    # Reset tracking
-                    st.job_track_name = ""
-                    st.job_track_started_at = 0.0
-                    st.job_track_last_mm = 0
-                    st.job_track_slot_mm = {}
-                    st.job_track_slot_g = {}
-                    st.job_track_last_state = ps_state
-            except Exception:
-                pass
-
-            # --- Job usage accounting ---
-            if filename or used_mm:
-                _apply_job_usage(st, filename or st.current_job or "", used_mm)
-                if used_g > 0.0:
-                    st.current_job_filament_g = float(round(used_g, 2))
-
-            # --- Moonraker history snapshot (global) ---
-            # This is useful to show past jobs even if our per-slot tracker
-            # wasn't running.  It won't reliably attribute usage to CFS slots,
-            # so the UI shows it separately.
-            try:
-                now = _now()
-                if (now - last_hist_fetch) >= hist_every_sec:
-                    hist = await asyncio.to_thread(_moonraker_fetch_history, base, 20)
-                    if hist:
-                        st.moonraker_history = hist
-                    last_hist_fetch = now
-            except Exception:
-                pass
-
-            save_state(st)
+            await _ws_connect_and_run(ws_url, printer_id)
+            backoff = 2.0  # reset on clean exit
         except Exception as e:
-            st = load_state()
+            last_err = str(e)
+            print(f"[WS] ({printer_id}) Connection lost: {e}")
+
+        try:
+            st = load_state(printer_id)
             st.printer_connected = False
-            st.printer_last_error = str(e)
-            st.updated_at = time.time()
-            save_state(st)
+            st.cfs_connected = False
+            st.printer_last_error = last_err
+            save_state(printer_id, st)
+        except Exception:
+            pass
 
-        await asyncio.sleep(interval)
+        print(f"[WS] ({printer_id}) Reconnecting in {backoff:.0f}s…")
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 60.0)
 
 
+def _moon_flush_to_spoolman(
+    printer_id: str,
+    reason: str,
+    *,
+    started_at: Optional[float] = None,
+    ended_at: Optional[float] = None,
+    job_name: str = "",
+) -> None:
+    """Sync accumulated per-slot grams to Spoolman, persist job stats, and reset trackers."""
+    st = load_state(printer_id)
+    job_g = _moon_job_track_slot_g.setdefault(printer_id, {})
+    job_mm = _moon_job_track_slot_mm.setdefault(printer_id, {})
+    ended_ts = ended_at or _now()
+    started_ts = started_at or ended_ts
+    spools: List[dict] = []
+    total_grams = 0.0
+    total_meters = 0.0
+    spoolman_base = _spoolman_base_url()
+    spool_color_cache: Dict[int, str] = {}
 
-app = FastAPI(title="3D Drucker Filament Manager", version="0.1.1")
+    for slot, g in job_g.items():
+        if g <= 0:
+            continue
+        slot_obj = st.slots.get(slot)
+        spool_id = getattr(slot_obj, "spoolman_id", None) if slot_obj else None
+        spool_id_norm = _spoolman_id_or_none(spool_id)
+        color_hex = _normalize_color_hex(str(getattr(slot_obj, "color_hex", "") or ""))
+        if spool_id_norm and spoolman_base:
+            if spool_id_norm not in spool_color_cache:
+                spool_color_cache[spool_id_norm] = ""
+                try:
+                    spool_data = _spoolman_get_spool(spoolman_base, spool_id_norm)
+                    filament = spool_data.get("filament") or {}
+                    spool_color_cache[spool_id_norm] = _normalize_color_hex(str(filament.get("color_hex") or ""))
+                except Exception as e:
+                    print(f"[MOON] ({printer_id}) spool color lookup failed for spool {spool_id_norm}: {e}")
+            if spool_color_cache.get(spool_id_norm):
+                color_hex = spool_color_cache[spool_id_norm]
+        meters = max(0.0, float(job_mm.get(slot, 0.0) or 0.0) / 1000.0)
+        total_grams += g
+        total_meters += meters
+        spools.append({
+            "slot": slot,
+            "spoolman_id": spool_id,
+            "material": str(getattr(slot_obj, "material", "") or ""),
+            "name": str(getattr(slot_obj, "name", "") or ""),
+            "manufacturer": str(getattr(slot_obj, "manufacturer", "") or ""),
+            "color_hex": color_hex,
+            "grams": round(g, 2),
+            "meters": round(meters, 4),
+        })
+        if spool_id:
+            _spoolman_report_usage(spool_id, g)
+            print(f"[MOON] ({printer_id}) {reason}: slot {slot} → {g:.2f}g synced to Spoolman spool {spool_id}")
+        else:
+            print(f"[MOON] ({printer_id}) {reason}: slot {slot} → {g:.2f}g (no Spoolman link, not synced)")
+    if not job_g:
+        print(f"[MOON] ({printer_id}) {reason}: no filament deltas recorded")
+
+    # Persist lifetime stats for each slot that consumed filament this job
+    now = _now()
+    for slot, g in job_g.items():
+        if g <= 0:
+            continue
+        stats = st.cfs_stats.get(slot) or SlotStats()
+        stats.total_kg = round(stats.total_kg + g / 1000.0, 6)
+        stats.total_meters = round(stats.total_meters + job_mm.get(slot, 0.0) / 1000.0, 4)
+        stats.last_used_at = now
+        st.cfs_stats[slot] = stats
+    history = st.job_history if isinstance(st.job_history, list) else []
+    history.append({
+        "printer_id": printer_id,
+        "job_name": job_name,
+        "reason": reason,
+        "started_at": started_ts,
+        "ended_at": ended_ts,
+        "spools": spools,
+        "total_grams": round(total_grams, 2),
+        "total_meters": round(total_meters, 4),
+    })
+    st.job_history = history[-10:]
+
+    if any(g > 0 for g in job_g.values()) or bool(st.job_history):
+        save_state(printer_id, st)
+
+    _moon_job_track_slot_g[printer_id] = {}
+    _moon_job_track_slot_mm[printer_id] = {}
+    _moon_last_filament_mm[printer_id] = 0.0
+
+
+async def moonraker_job_poll_loop(printer_id: str) -> None:
+    """Poll Moonraker print_stats every 5s; attribute each filament delta to the active slot."""
+    base = _moonraker_base_url(printer_id)
+    if not base:
+        print(f"[MOON] ({printer_id}) No printer URL configured — job poll loop not started.")
+        return
+
+    print(f"[MOON] ({printer_id}) Starting job poll loop against {base}")
+
+    _ACTIVE_STATES = {"printing", "paused"}
+
+    while True:
+        await asyncio.sleep(5.0)
+        try:
+            url = f"{base}/printer/objects/query?print_stats"
+            data = _http_get_json(url, timeout=5.0)
+            ps = (data.get("result") or {}).get("status", {}).get("print_stats") or {}
+            new_state = str(ps.get("state") or "").lower()
+            filament_used_mm = float(ps.get("filament_used") or 0)
+            job_name = str(ps.get("filename") or ps.get("job_name") or "").strip()
+
+            prev = _moon_last_state.get(printer_id, "")
+            _moon_last_state[printer_id] = new_state
+
+            if new_state in _ACTIVE_STATES and prev not in _ACTIVE_STATES:
+                # Job started — reset trackers
+                _moon_job_track_slot_g[printer_id] = {}
+                _moon_job_track_slot_mm[printer_id] = {}
+                _moon_last_filament_mm[printer_id] = filament_used_mm
+                _moon_job_started_at[printer_id] = _now()
+                _moon_job_name[printer_id] = job_name
+                print(f"[MOON] ({printer_id}) State: {prev!r} → {new_state!r}; tracking filament deltas per active slot")
+
+            elif new_state in _ACTIVE_STATES:
+                if job_name:
+                    _moon_job_name[printer_id] = job_name
+                # Still printing/paused — attribute delta to currently active slot
+                delta_mm = max(0.0, filament_used_mm - _moon_last_filament_mm.get(printer_id, 0.0))
+                _moon_last_filament_mm[printer_id] = filament_used_mm
+                if delta_mm > 0:
+                    st = load_state(printer_id)
+                    curr_slot = st.cfs_active_slot or st.active_slot
+                    if curr_slot and curr_slot in st.slots:
+                        mat_str = str(getattr(st.slots[curr_slot], "material", "OTHER") or "OTHER")
+                        g = mm_to_g(mat_str, delta_mm)
+                        if g > 0:
+                            job_g = _moon_job_track_slot_g.setdefault(printer_id, {})
+                            job_mm = _moon_job_track_slot_mm.setdefault(printer_id, {})
+                            job_g[curr_slot] = job_g.get(curr_slot, 0.0) + g
+                            job_mm[curr_slot] = job_mm.get(curr_slot, 0.0) + delta_mm
+
+            elif new_state in {"complete", "error", "cancelled"} and prev in _ACTIVE_STATES:
+                # Capture any final delta, then flush accumulated grams to Spoolman
+                delta_mm = max(0.0, filament_used_mm - _moon_last_filament_mm.get(printer_id, 0.0))
+                if delta_mm > 0:
+                    st = load_state(printer_id)
+                    curr_slot = st.cfs_active_slot or st.active_slot
+                    if curr_slot and curr_slot in st.slots:
+                        mat_str = str(getattr(st.slots[curr_slot], "material", "OTHER") or "OTHER")
+                        g = mm_to_g(mat_str, delta_mm)
+                        if g > 0:
+                            job_g = _moon_job_track_slot_g.setdefault(printer_id, {})
+                            job_mm = _moon_job_track_slot_mm.setdefault(printer_id, {})
+                            job_g[curr_slot] = job_g.get(curr_slot, 0.0) + g
+                            job_mm[curr_slot] = job_mm.get(curr_slot, 0.0) + delta_mm
+                print(f"[MOON] ({printer_id}) State: {prev!r} → {new_state!r}; {filament_used_mm:.0f}mm total filament used")
+                _moon_flush_to_spoolman(
+                    printer_id,
+                    f"Job {new_state}",
+                    started_at=_moon_job_started_at.get(printer_id),
+                    ended_at=_now(),
+                    job_name=_moon_job_name.get(printer_id, job_name),
+                )
+                _moon_job_started_at.pop(printer_id, None)
+                _moon_job_name.pop(printer_id, None)
+
+        except Exception:
+            # Network errors are expected when printer is off — don't log verbosely
+            pass
+
+
+app = FastAPI(title="CFSync", version="0.1.1")
+
+# Allow the Fluidd panel bookmarklet to fetch from a different origin (local network only)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 
 @app.middleware("http")
@@ -1029,9 +1586,12 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 @app.on_event("startup")
 async def _startup():
     _ensure_data_files()
-    cfg = load_config()
-    if (cfg.get("moonraker_url") or "").strip():
-        asyncio.create_task(moonraker_poll_loop())
+    printer_ids = [str((p or {}).get("id") or "") for p in (load_config().get("printers") or []) if (p or {}).get("id")]
+    if not printer_ids:
+        print("[BOOT] No printers configured — waiting for data/config.json")
+    for pid in printer_ids:
+        asyncio.create_task(printer_ws_loop(pid))
+        asyncio.create_task(moonraker_job_poll_loop(pid))
 
 
 @app.get("/")
@@ -1041,84 +1601,10 @@ def index():
 
 # --- Public API ---
 @app.get("/api/state", response_model=AppState)
-def api_state():
-    return load_state()
+def api_state(printer_id: Optional[str] = None):
+    pid = _resolve_printer_id(printer_id, allow_unknown=printer_id is None)
+    return load_state(pid)
 
-
-@app.post("/api/moonraker/allocate", response_model=AppState)
-def api_moonraker_allocate(req: MoonrakerAllocateRequest):
-    """Store local per-slot allocation for a Moonraker history job.
-
-    This never talks to the printer. It only enriches our local per-slot history.
-    """
-    st = load_state()
-    key = (req.job_key or "").strip() or _job_key(req.job_key, req.ts, req.job)
-
-    # Normalize alloc_g: drop zeros/negatives
-    alloc: Dict[str, float] = {}
-    for sid, g in (req.alloc_g or {}).items():
-        try:
-            gv = float(g)
-            if gv > 0:
-                alloc[str(sid)] = float(round(gv, 2))
-        except Exception:
-            continue
-
-    if not alloc:
-        raise HTTPException(status_code=400, detail="alloc_g must contain at least one positive value")
-
-    # Persist allocation
-    st.moonraker_allocations[key] = {"job": req.job, "ts": float(req.ts), "alloc_g": alloc}
-
-    # Push entries into per-slot history (and replace previous pushes for this key)
-    # We keep a marker so we can de-duplicate.
-    marker = f"moonraker:{key}"
-    for sid in alloc.keys():
-        h = st.slot_history.get(sid)
-        if isinstance(h, list):
-            # Remove previous entries for this marker and adjust epoch totals accordingly.
-            new_h = []
-            removed_g = 0.0
-            for e in h:
-                if isinstance(e, dict) and e.get("_src") == marker:
-                    try:
-                        removed_g += float(e.get("used_g") or 0.0)
-                    except Exception:
-                        pass
-                    continue
-                new_h.append(e)
-            st.slot_history[sid] = new_h
-            if removed_g > 0:
-                try:
-                    s = st.slots.get(sid)
-                    if s:
-                        # Only subtract from current epoch total if the marker entries
-                        # were added in the current epoch.
-                        # (Older epochs should not affect current totals.)
-                        # We approximate by checking the current slot epoch matches the
-                        # epoch on the first removed entry if available.
-                        s.spool_epoch_consumed_g_total = max(0.0, float(getattr(s, "spool_epoch_consumed_g_total", 0.0) or 0.0) - float(removed_g))
-                        st.slots[sid] = s
-                except Exception:
-                    pass
-
-    for sid, g in alloc.items():
-        _hist_push(
-            st,
-            sid,
-            {
-                "ts": float(req.ts),
-                "job": req.job,
-                "used_mm": 0,
-                "used_g": float(round(float(g), 2)),
-                "result": "history",
-                "_src": marker,
-            },
-        )
-        _inc_slot_epoch_consumed(st, sid, float(g))
-
-    save_state(st)
-    return st
 
 
 def _ui_state_dict(state: AppState) -> dict:
@@ -1134,74 +1620,65 @@ def _ui_state_dict(state: AppState) -> dict:
             out["color"] = out.pop("color_hex")
         if "manufacturer" in out and "vendor" not in out:
             out["vendor"] = out.get("manufacturer", "")
-
-        # Derived spool metrics (purely local)
-        # - spool_consumed_g: running total for current epoch (stable even if UI history is trimmed)
-        # - spool_used_g: consumption since the last "Übernehmen" reference
-        # - spool_remaining_g: computed remaining weight
-        try:
-            consumed = float(out.get("spool_epoch_consumed_g_total") or 0.0)
-            out["spool_consumed_g"] = round(consumed, 2)
-
-            ref_rem = out.get("spool_ref_remaining_g")
-            ref_cons = out.get("spool_ref_consumed_g")
-            if ref_rem is not None and ref_cons is not None:
-                # Remaining decreases only by consumption since reference point
-                since = max(0.0, consumed - float(ref_cons))
-                remaining = max(0.0, float(ref_rem) - since)
-                out["spool_remaining_g"] = round(remaining, 1)
-                out["spool_used_g"] = round(since, 1)
-        except Exception:
-            pass
-
         slots_out[slot_id] = out
     d["slots"] = slots_out
 
-    # UI expects job info as flat fields
-    d.setdefault("current_job", "")
-    d.setdefault("current_job_filament_mm", 0)
-    d.setdefault("current_job_filament_g", 0.0)
-
-    # printer connection info for header badge
     d.setdefault("printer_connected", False)
     d.setdefault("printer_last_error", "")
-
     d.setdefault("cfs_connected", False)
     d.setdefault("cfs_last_update", 0.0)
     d.setdefault("cfs_active_slot", None)
     d.setdefault("cfs_slots", {})
-    d.setdefault("cfs_raw", {})
+    d.setdefault("cfs_stats", {})
+    d.setdefault("job_history", [])
+    d["job_history"] = _ui_hydrate_job_history_colors(d["job_history"])
+    d["spoolman_configured"] = bool(_spoolman_base_url())
+    d["spoolman_url"] = _spoolman_base_url()
 
     return d
-
-
-def _slot_consumed_g_epoch(state: AppState, slot: str) -> float:
-    try:
-        s = state.slots.get(slot)
-        return float(getattr(s, "spool_epoch_consumed_g_total", 0.0) or 0.0)
-    except Exception:
-        return 0.0
 
 
 # --- UI API (static frontend uses /api/ui/* and expects {"result": ...}) ---
 @app.get("/api/ui/state", response_model=ApiResponse)
 def api_ui_state() -> ApiResponse:
-    return ApiResponse(result=_ui_state_dict(load_state()))
+    printers_out = []
+    for pid in _all_printer_ids():
+        st = load_state(pid)
+        d = _ui_state_dict(st)
+        d["printer_id"] = pid
+        printers_out.append({"id": pid, "state": d})
+    return ApiResponse(result={
+        "printers": printers_out,
+        "spoolman_configured": bool(_spoolman_base_url()),
+        "spoolman_url": _spoolman_base_url(),
+    })
 
 
-@app.post("/api/ui/moonraker/allocate", response_model=ApiResponse)
-def api_ui_moonraker_allocate(req: MoonrakerAllocateRequest) -> ApiResponse:
-    st = api_moonraker_allocate(req)
-    return ApiResponse(result=_ui_state_dict(st))
+@app.get("/api/printers")
+def api_printers():
+    printers = []
+    for pid in _all_printer_ids():
+        st = load_state(pid)
+        printers.append({
+            "id": pid,
+            "address": _printer_address(pid),
+            "name": st.printer_name,
+            "firmware": st.printer_firmware,
+            "connected": st.printer_connected,
+            "cfs_connected": st.cfs_connected,
+            "last_error": st.printer_last_error,
+        })
+    return {"printers": printers}
 
 
 @app.post("/api/select_slot", response_model=AppState)
 def api_select_slot(req: SelectSlotRequest):
-    state = load_state()
+    pid = _resolve_printer_id(req.printer_id, allow_unknown=req.printer_id is None)
+    state = load_state(pid)
     if req.slot not in state.slots:
         raise HTTPException(status_code=404, detail="Unknown slot")
     state.active_slot = req.slot
-    save_state(state)
+    save_state(pid, state)
     return state
 
 
@@ -1213,9 +1690,10 @@ def api_ui_select_slot(req: SelectSlotRequest) -> ApiResponse:
 
 @app.post("/api/set_auto", response_model=AppState)
 def api_set_auto(req: SetAutoRequest):
-    state = load_state()
+    pid = _resolve_printer_id(req.printer_id, allow_unknown=req.printer_id is None)
+    state = load_state(pid)
     state.auto_mode = bool(req.enabled)
-    save_state(state)
+    save_state(pid, state)
     return state
 
 
@@ -1227,23 +1705,26 @@ def api_ui_set_auto(req: SetAutoRequest) -> ApiResponse:
 
 @app.patch("/api/slots/{slot}", response_model=AppState)
 def api_update_slot(slot: str, req: UpdateSlotRequest):
-    state = load_state()
+    pid = _resolve_printer_id(req.printer_id, allow_unknown=req.printer_id is None)
+    state = load_state(pid)
     if slot not in state.slots:
         raise HTTPException(status_code=404, detail="Unknown slot")
 
     s = state.slots[slot]
     update = _req_dump(req, exclude_unset=True)
     for k, v in update.items():
-        setattr(s, k, v)
+        if hasattr(s, k):
+            setattr(s, k, v)
 
     state.slots[slot] = s
-    save_state(state)
+    save_state(pid, state)
     return state
 
 
 @app.post("/api/ui/slot/update", response_model=ApiResponse)
 def api_ui_slot_update(req: UiSlotUpdateRequest) -> ApiResponse:
-    state = load_state()
+    pid = _resolve_printer_id(req.printer_id, allow_unknown=req.printer_id is None)
+    state = load_state(pid)
     slot = req.slot
     if slot not in state.slots:
         raise HTTPException(status_code=404, detail="Unknown slot")
@@ -1268,145 +1749,295 @@ def api_ui_slot_update(req: UiSlotUpdateRequest) -> ApiResponse:
             setattr(s, k, v)
 
     state.slots[slot] = s
-    save_state(state)
+    save_state(pid, state)
     return ApiResponse(result=_ui_state_dict(state))
 
-
-@app.post("/api/ui/slot/reset", response_model=ApiResponse)
-def api_ui_slot_reset(req: UiSlotResetRequest) -> ApiResponse:
-    state = load_state()
-    slot = req.slot
-    if slot not in state.slots:
-        raise HTTPException(status_code=404, detail="Unknown slot")
-    state.slots[slot].remaining_g = float(req.remaining_g)
-    save_state(state)
-    return ApiResponse(result=_ui_state_dict(state))
 
 
 @app.post("/api/ui/spool/set_start", response_model=ApiResponse)
 def api_ui_spool_set_start(req: UiSpoolSetStartRequest) -> ApiResponse:
-    """Roll change: set new spool baseline (local only).
-
-    Historical entries are kept, but hidden by incrementing the slot's spool_epoch.
-    The new spool's remaining weight is set as the reference point.
-    """
-    state = load_state()
+    """Roll change: increment epoch and auto-unlink Spoolman spool."""
+    pid = _resolve_printer_id(req.printer_id, allow_unknown=req.printer_id is None)
+    state = load_state(pid)
     slot = req.slot
     if slot not in state.slots:
         raise HTTPException(status_code=404, detail="Unknown slot")
 
-    start_g = float(req.start_g)
     s = state.slots[slot]
-    # New roll => new epoch
+    # New roll => new epoch (hides old history in Spoolman status, triggers auto-unlink)
     try:
         s.spool_epoch = int(getattr(s, "spool_epoch", 0) or 0) + 1
     except Exception:
         s.spool_epoch = 1
-
-    # Reset accounting for the new epoch
-    s.spool_epoch_consumed_g_total = 0.0
-    s.spool_ref_remaining_g = start_g
-    s.spool_ref_consumed_g = 0.0
-    s.spool_ref_set_at = time.time()
-    # keep legacy fields for debugging only
-    s.spool_start_g = start_g
-    s.remaining_g = start_g
+    # Roll change auto-unlinks Spoolman spool
+    s.spoolman_id = None
     state.slots[slot] = s
-    save_state(state)
+    # Reset WS length baseline so next snapshot doesn't trigger a false delta
+    state.ws_slot_length_m.pop(slot, None)
+    # Clear RFID/state cache so re-inserting any spool triggers auto-link again
+    _ws_last_rfid.setdefault(pid, {}).pop(slot, None)
+    _ws_last_state.setdefault(pid, {}).pop(slot, None)
+    _ws_last_fingerprint.setdefault(pid, {}).pop(slot, None)
+    save_state(pid, state)
     return ApiResponse(result=_ui_state_dict(state))
 
 
-@app.post("/api/ui/spool/set_remaining", response_model=ApiResponse)
-def api_ui_spool_set_remaining(req: UiSpoolSetRemainingRequest) -> ApiResponse:
-    """Übernehmen: set measured remaining weight as new reference (local only).
 
-    Does NOT reset epoch and does not delete history. Remaining is computed as:
-      remaining = ref_remaining - (consumed_epoch - ref_consumed)
-    """
-    state = load_state()
+# --- Spoolman integration endpoints ---
+
+@app.get("/api/ui/spoolman/spools")
+def api_ui_spoolman_spools(slot: str = "1A", printer_id: Optional[str] = None):
+    """Fetch available Spoolman spools, sorted by match quality for the given slot."""
+    base = _spoolman_base_url()
+    if not base:
+        raise HTTPException(status_code=400, detail="Spoolman URL not configured")
+
+    pid = _resolve_printer_id(printer_id, allow_unknown=printer_id is None)
+    state = load_state(pid)
+    s = state.slots.get(slot)
+    cfs_slot = state.cfs_slots.get(slot) if isinstance(state.cfs_slots, dict) else None
+    has_cfs_snapshot = isinstance(state.cfs_slots, dict) and bool(state.cfs_slots)
+    slot_present = True
+    if isinstance(cfs_slot, dict):
+        slot_present = bool(cfs_slot.get("present", True))
+    elif has_cfs_snapshot:
+        slot_present = False
+    slot_material = (getattr(s, "material", "") or "").upper() if (s and slot_present) else ""
+    slot_color = (getattr(s, "color_hex", "") or "").lower() if (s and slot_present) else ""
+
+    try:
+        raw = _spoolman_get_spools(base)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Spoolman unreachable: {e}")
+
+    spools = []
+    for sp in raw:
+        filament = sp.get("filament") or {}
+        mat = (filament.get("material") or "").upper()
+        color_hex = (filament.get("color_hex") or "").lower()
+        name = filament.get("name") or ""
+        vendor = (filament.get("vendor") or {}).get("name", "")
+        remaining = sp.get("remaining_weight")
+
+        # Score: lower is better. Same material gets a big bonus.
+        score = 0
+        if mat == slot_material:
+            score -= 1000
+        if slot_color and color_hex:
+            score += _color_distance(slot_color, color_hex)
+
+        spools.append({
+            "id": sp.get("id"),
+            "filament_name": name,
+            "vendor": vendor,
+            "material": mat,
+            "color_hex": color_hex,
+            "remaining_weight": remaining,
+            "_score": score,
+        })
+
+    spools.sort(key=lambda x: x["_score"])
+    for sp in spools:
+        del sp["_score"]
+
+    return {"spools": spools, "slot": slot, "printer_id": pid}
+
+
+@app.post("/api/ui/spoolman/link", response_model=ApiResponse)
+def api_ui_spoolman_link(req: SpoolmanLinkRequest) -> ApiResponse:
+    """Link a Spoolman spool to a CFS slot. Imports remaining_weight as local reference."""
+    base = _spoolman_base_url()
+    if not base:
+        raise HTTPException(status_code=400, detail="Spoolman URL not configured")
+
+    pid = _resolve_printer_id(req.printer_id, allow_unknown=req.printer_id is None)
+    state = load_state(pid)
     slot = req.slot
     if slot not in state.slots:
         raise HTTPException(status_code=404, detail="Unknown slot")
 
-    rem_g = float(req.remaining_g)
+    try:
+        sp = _spoolman_get_spool(base, req.spoolman_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Spoolman unreachable: {e}")
+
+    filament = sp.get("filament") or {}
+
     s = state.slots[slot]
-    consumed_now = _slot_consumed_g_epoch(state, slot)
-    s.spool_ref_remaining_g = rem_g
-    s.spool_ref_consumed_g = float(round(consumed_now, 4))
-    s.spool_ref_set_at = time.time()
-    # legacy
-    s.remaining_g = rem_g
+    s.spoolman_id = req.spoolman_id
+
+    # Import spool metadata from Spoolman
+    mat_raw = (filament.get("material") or "").strip().upper()
+    if mat_raw in ("PLA", "PETG", "ABS", "ASA", "TPU", "PA", "PC"):
+        s.material = mat_raw
+    color_hex = (filament.get("color_hex") or "").strip()
+    if color_hex and len(color_hex) == 7 and color_hex.startswith("#"):
+        s.color_hex = color_hex
+    fname = (filament.get("name") or "").strip()
+    if fname:
+        s.name = fname
+    vendor_name = ((filament.get("vendor") or {}).get("name") or "").strip()
+    if vendor_name:
+        s.manufacturer = vendor_name
+
     state.slots[slot] = s
-    save_state(state)
+    save_state(pid, state)
+
+    # Write the slot's CFS RFID to the Spoolman spool's extra field for future auto-linking.
+    # Only do this when the slot is state=2 (physical RFID chip detected). state=1 (manual)
+    # slots may carry a non-empty rfid field in the WS data (residual/bleed from adjacent slot)
+    # that must not be written, otherwise two different spools end up with the same cfs_rfid.
+    cfs_slot_data = state.cfs_slots.get(slot) or {}
+    rfid = cfs_slot_data.get("rfid", "")
+    if rfid and cfs_slot_data.get("state") == 2:
+        _spoolman_set_extra(req.spoolman_id, "cfs_rfid", rfid)
+        _ws_last_rfid.setdefault(pid, {})[slot] = rfid  # mark as seen so auto-link doesn't re-trigger this cycle
+
     return ApiResponse(result=_ui_state_dict(state))
+
+
+@app.post("/api/ui/spoolman/unlink", response_model=ApiResponse)
+def api_ui_spoolman_unlink(req: SpoolmanUnlinkRequest) -> ApiResponse:
+    """Clear Spoolman link on a slot. Local tracking is unaffected."""
+    pid = _resolve_printer_id(req.printer_id, allow_unknown=req.printer_id is None)
+    state = load_state(pid)
+    slot = req.slot
+    if slot not in state.slots:
+        raise HTTPException(status_code=404, detail="Unknown slot")
+
+    state.slots[slot].spoolman_id = None
+    save_state(pid, state)
+    return ApiResponse(result=_ui_state_dict(state))
+
+
+@app.post("/api/ui/jobs/reallocate_spool", response_model=ApiResponse)
+def api_ui_jobs_reallocate_spool(req: JobReallocateSpoolRequest) -> ApiResponse:
+    """Relink a completed job spool usage entry to another Spoolman spool."""
+    base = _spoolman_base_url()
+    if not base:
+        raise HTTPException(status_code=400, detail="Spoolman URL not configured")
+
+    pid = _resolve_printer_id(req.printer_id, allow_unknown=req.printer_id is None)
+    state = load_state(pid)
+    history = state.job_history if isinstance(state.job_history, list) else []
+
+    target_spool = None
+    req_slot = str(req.slot)
+    req_ended_at = float(req.ended_at)
+    for job in reversed(history):
+        if not isinstance(job, dict):
+            continue
+        try:
+            ended_at = float(job.get("ended_at") or 0.0)
+        except Exception:
+            ended_at = 0.0
+        if abs(ended_at - req_ended_at) > 1.0:
+            continue
+        spools = job.get("spools") or []
+        if not isinstance(spools, list):
+            continue
+        for sp in spools:
+            if not isinstance(sp, dict):
+                continue
+            if str(sp.get("slot") or "") == req_slot:
+                target_spool = sp
+                break
+        if target_spool:
+            break
+
+    if target_spool is None:
+        raise HTTPException(status_code=404, detail="Job spool entry not found")
+
+    try:
+        new_spool = _spoolman_get_spool(base, req.spoolman_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Spoolman unreachable: {e}")
+
+    grams = max(0.0, float(target_spool.get("grams") or 0.0))
+    old_spool_id = _spoolman_id_or_none(target_spool.get("spoolman_id"))
+    new_spool_id = int(req.spoolman_id)
+
+    # Move historical usage between Spoolman spools:
+    # - Remove job usage from the new linked spool
+    # - Add that usage back to the old linked spool (if there was one)
+    if grams > 0 and old_spool_id != new_spool_id:
+        old_remaining = None
+        old_target = None
+        if old_spool_id:
+            try:
+                old_spool = _spoolman_get_spool(base, old_spool_id)
+                old_remaining = _spoolman_remaining_weight(old_spool)
+                old_target = old_remaining + grams
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Failed to read previous spool #{old_spool_id}: {e}")
+        new_remaining = _spoolman_remaining_weight(new_spool)
+        new_target = max(0.0, new_remaining - grams)
+        try:
+            _spoolman_set_remaining_weight(base, new_spool_id, new_target)
+            if old_spool_id and old_target is not None:
+                _spoolman_set_remaining_weight(base, old_spool_id, old_target)
+        except Exception as e:
+            # Best-effort rollback so we do not leave usage in a half-moved state.
+            try:
+                _spoolman_set_remaining_weight(base, new_spool_id, new_remaining)
+            except Exception:
+                pass
+            raise HTTPException(status_code=502, detail=f"Failed to move spool usage: {e}")
+
+    filament = new_spool.get("filament") or {}
+    target_spool["spoolman_id"] = new_spool_id
+    if filament.get("material") is not None:
+        target_spool["material"] = str(filament.get("material") or "").upper()
+    if filament.get("name") is not None:
+        target_spool["name"] = str(filament.get("name") or "")
+    if filament.get("vendor") is not None:
+        target_spool["manufacturer"] = str((filament.get("vendor") or {}).get("name") or "")
+    target_spool["color_hex"] = _normalize_color_hex(str(filament.get("color_hex") or ""))
+
+    state.job_history = history[-10:]
+    save_state(pid, state)
+    return ApiResponse(result=_ui_state_dict(state))
+
+
+@app.get("/api/ui/spoolman/spool_detail")
+def api_ui_spoolman_spool_detail(slot: str = "1A", printer_id: Optional[str] = None):
+    """Proxy Spoolman spool status for a given CFS slot.
+
+    Returns {"linked": bool, "slot": str, "spool": dict|null, "error": str|null}.
+    Never raises HTTP 502 — Spoolman unavailability is returned as a structured error
+    so the frontend can degrade gracefully.
+    """
+    pid = _resolve_printer_id(printer_id, allow_unknown=printer_id is None)
+    state = load_state(pid)
+    slot_obj = state.slots.get(slot)
+    if slot_obj is None:
+        raise HTTPException(status_code=404, detail="Unknown slot")
+
+    spool_id = getattr(slot_obj, "spoolman_id", None)
+    if not spool_id:
+        return {"linked": False, "slot": slot, "spool": None, "error": None, "printer_id": pid}
+
+    base = _spoolman_base_url()
+    if not base:
+        return {"linked": True, "slot": slot, "spool": None, "error": "not_configured", "printer_id": pid}
+
+    try:
+        sp = _spoolman_get_spool(base, spool_id)
+        return {"linked": True, "slot": slot, "spool": sp, "error": None, "printer_id": pid}
+    except Exception as e:
+        return {"linked": True, "slot": slot, "spool": None, "error": "unreachable", "printer_id": pid}
 
 
 @app.post("/api/ui/set_color", response_model=ApiResponse)
 def api_ui_set_color(req: UiSetColorRequest) -> ApiResponse:
-    state = load_state()
+    pid = _resolve_printer_id(req.printer_id, allow_unknown=req.printer_id is None)
+    state = load_state(pid)
     if req.slot not in state.slots:
         raise HTTPException(status_code=404, detail="Unknown slot")
     state.slots[req.slot].color_hex = req.color
-    save_state(state)
+    save_state(pid, state)
     return ApiResponse(result=_ui_state_dict(state))
 
-
-@app.post("/api/spool/reset", response_model=AppState)
-def api_spool_reset(req: SpoolResetRequest):
-    state = load_state()
-    if req.slot not in state.slots:
-        raise HTTPException(status_code=404, detail="Unknown slot")
-    state.slots[req.slot].remaining_g = float(req.remaining_g)
-    save_state(state)
-    return state
-
-
-@app.post("/api/spool/apply_usage", response_model=AppState)
-def api_spool_apply_usage(req: SpoolApplyUsageRequest):
-    state = load_state()
-    if req.slot not in state.slots:
-        raise HTTPException(status_code=404, detail="Unknown slot")
-
-    current = state.slots[req.slot].remaining_g
-    if current is None:
-        raise HTTPException(status_code=409, detail="remaining_g is not set for this slot")
-
-    new_val = max(0.0, float(current) - float(req.used_g))
-    state.slots[req.slot].remaining_g = new_val
-    save_state(state)
-    return state
-
-
-@app.post("/api/job/set", response_model=AppState)
-def api_job_set(req: JobSetRequest):
-    state = load_state()
-    state.current_job = req.name
-    state.current_job_filament_mm = 0
-    state.current_job_filament_g = 0.0
-    state.last_accounted_job_mm = 0
-    state.last_accounted_slot = state.active_slot
-    save_state(state)
-    return state
-
-
-@app.post("/api/ui/job/set", response_model=ApiResponse)
-def api_ui_job_set(req: JobSetRequest) -> ApiResponse:
-    state = api_job_set(req)
-    return ApiResponse(result=_ui_state_dict(state))
-
-
-@app.post("/api/job/update", response_model=AppState)
-def api_job_update(req: JobUpdateRequest):
-    state = load_state()
-    _apply_job_usage(state, state.current_job or "", int(req.used_mm), slot_override=req.slot)
-    save_state(state)
-    return state
-
-
-@app.post("/api/ui/job/update", response_model=ApiResponse)
-def api_ui_job_update(req: JobUpdateRequest) -> ApiResponse:
-    state = api_job_update(req)
-    return ApiResponse(result=_ui_state_dict(state))
 
 
 @app.post("/api/feed")
@@ -1434,14 +2065,19 @@ def api_ui_retract(req: RetractRequest) -> ApiResponse:
 
 
 @app.get("/api/ui/help", response_model=ApiResponse)
-def api_ui_help() -> ApiResponse:
-    text = (
-        "Klick einen Slot, um ihn aktiv zu setzen.\n"
-        "Mit den Farb-Presets setzt du die Farbe auf den aktiven Slot.\n"
-        "Zuführ/Zurückziehen sind aktuell Adapter-Hooks (Dummy), bis wir echte Hardware anbinden.\n"
-        "Job-Verbrauch: Wenn du Moonraker nutzt, trage moonraker_url in data/config.json ein, dann wird der Job + filament_used automatisch übernommen.\n"
-        "Alternativ kannst du manuell /api/ui/job/update nutzen."
-    )
+def api_ui_help(lang: str = "de") -> ApiResponse:
+    if lang == "en":
+        text = (
+            "Click a slot to set it as active.\n"
+            "Set printer_urls (or printers) in data/config.json to your printer IPs to enable live CFS slot sync via WebSocket.\n"
+            "Link a Spoolman spool to a slot to track filament consumption automatically."
+        )
+    else:
+        text = (
+            "Klick einen Slot, um ihn aktiv zu setzen.\n"
+            "Trage printer_urls (oder printers) in data/config.json mit den IPs deiner Drucker ein, um die CFS-Slots per WebSocket zu synchronisieren.\n"
+            "Verknüpfe einen Spoolman-Spool mit einem Slot, um den Filamentverbrauch automatisch zu verfolgen."
+        )
     return ApiResponse(result={"text": text})
 
 
@@ -1455,31 +2091,36 @@ def api_health():
 def default_state() -> AppState:
     """Safe defaults if state.json is missing/broken.
 
-    Must always include all 4x4 CFS slots so the UI never crashes, even if the
-    state file is corrupted.
+    Must always include all 4x4 CFS slots and the direct printer spool input so
+    the UI never crashes, even if the state file is corrupted.
     """
     slots: Dict[str, SlotState] = {}
     for sid in DEFAULT_SLOTS:
-        slots[sid] = SlotState(slot=sid, material="OTHER", color_hex="#00aaff", remaining_g=0.0)
+        slots[sid] = SlotState(slot=sid, material="OTHER", color_hex="#00aaff")
+    slots[PRINTER_SPOOL_SLOT] = SlotState(slot=PRINTER_SPOOL_SLOT, material="OTHER", color_hex="#00aaff")
 
     # Sensible demo defaults for Box 2 (matches the UI screenshot vibe)
     slots["2A"].material = "ABS"
     slots["2A"].color_hex = "#4b0082"  # indigo-ish
-    slots["2A"].remaining_g = 1000.0
 
     return AppState(
         active_slot="2A",
         auto_mode=False,
         updated_at=_now(),
         slots=slots,  # type: ignore[arg-type]
-        current_job="",
-        current_job_filament_mm=0,
-        current_job_filament_g=0.0,
         printer_connected=False,
         printer_last_error="",
         cfs_connected=False,
         cfs_last_update=0.0,
         cfs_active_slot=None,
         cfs_slots={},
-        cfs_raw={},
     )
+
+
+def default_multi_state() -> MultiAppState:
+    printers: Dict[str, AppState] = {}
+    for p in load_config().get("printers") or []:
+        pid = str((p or {}).get("id") or "")
+        if pid:
+            printers[pid] = default_state()
+    return MultiAppState(printers=printers, updated_at=_now())
