@@ -321,6 +321,30 @@ code{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospa
 .moonJob{font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
 .moonNums{font-weight:700; color:rgba(255,255,255,0.92); white-space:nowrap;}
 .moonSub{margin-top:6px; display:flex; flex-wrap:wrap; gap:10px; font-size:12px; color:rgba(255,255,255,0.72);}
+.moonSpoolList{margin-top:8px;display:flex;flex-direction:column;gap:7px;}
+.moonSpoolRow{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  border:1px solid rgba(255,255,255,0.06);
+  background:rgba(10,16,24,0.45);
+  border-radius:12px;
+  padding:7px 9px;
+}
+.moonSpoolInfo{display:flex;align-items:center;gap:8px;min-width:0;}
+.moonSpoolSwatch{
+  width:14px;
+  height:14px;
+  border-radius:4px;
+  border:1px solid rgba(255,255,255,.20);
+  background:rgba(255,255,255,.10);
+  flex-shrink:0;
+}
+.moonSpoolTextWrap{min-width:0;display:flex;flex-direction:column;gap:1px;}
+.moonSpoolLabel{font-size:12px;font-weight:600;color:rgba(255,255,255,0.9);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.moonSpoolMeta{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.moonSpoolEmpty{font-size:12px;color:var(--muted);}
 .miniPills{display:flex; flex-wrap:wrap; gap:6px;}
 .miniPill{border:1px solid rgba(255,255,255,0.08); background:rgba(10,16,24,0.55); border-radius:999px; padding:3px 8px; font-size:12px; color:rgba(255,255,255,0.82);}
 

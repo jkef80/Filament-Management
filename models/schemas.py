@@ -170,6 +170,13 @@ class SpoolmanUnlinkRequest(BaseModel):
     slot: PrinterInputId
 
 
+class JobReallocateSpoolRequest(BaseModel):
+    printer_id: Optional[str] = None
+    ended_at: float
+    slot: PrinterInputId
+    spoolman_id: int = Field(gt=0)
+
+
 class MultiAppState(BaseModel):
     printers: Dict[str, AppState]
     updated_at: float = Field(default_factory=lambda: time.time())

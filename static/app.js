@@ -137,6 +137,46 @@ async function postJson(url, payload) {
   return r.json();
 }
 
+function normalizeHexColor(raw) {
+  const v = String(raw || "").trim().toLowerCase();
+  if (!v) return "";
+  const col = v.startsWith("#") ? v : "#" + v;
+  return /^#[0-9a-f]{6}$/.test(col) ? col : "";
+}
+
+function recentJobSlotLabel(slotId) {
+  const sid = String(slotId || "").toUpperCase();
+  if (sid === PRINTER_SPOOL_SLOT) return "Spool";
+  if (/^[1-4][A-D]$/.test(sid)) return `CFS Box ${sid[0]} · ${sid}`;
+  return sid || "—";
+}
+
+async function promptSpoolmanSpoolId(printerId, slotId, currentSpoolId) {
+  const r = await fetch(`/api/ui/spoolman/spools?slot=${encodeURIComponent(slotId)}&printer_id=${encodeURIComponent(printerId || "")}`, {
+    cache: "no-store",
+  });
+  if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
+  const data = await r.json();
+  const spools = Array.isArray(data.spools) ? data.spools : [];
+  if (!spools.length) throw new Error("No Spoolman spools available");
+
+  const preview = spools
+    .slice(0, 20)
+    .map((sp) => {
+      const remaining = sp.remaining_weight != null ? fmtG(sp.remaining_weight) : "—";
+      return `#${sp.id} ${sp.vendor || ""} ${sp.filament_name || ""} ${sp.material || ""} ${remaining}`.trim();
+    })
+    .join("\n");
+  const suggested = currentSpoolId ? String(currentSpoolId) : String(spools[0].id || "");
+  const picked = window.prompt(`Enter Spoolman ID for ${slotId}:\n\n${preview}`, suggested);
+  if (picked == null) return null;
+  const spoolId = Number(picked);
+  if (!Number.isInteger(spoolId) || spoolId <= 0) {
+    throw new Error("Invalid Spoolman ID");
+  }
+  return spoolId;
+}
+
 // --- Spoolman integration ---
 let spoolmanConfigured = false;
 
@@ -886,6 +926,7 @@ function renderRecentJobsCard(printers) {
         startedAt,
         endedAt,
         printer: String(j.printer_id || pid || "—"),
+        jobName: String(j.job_name || ""),
         spools,
         totalMeters,
         totalGrams,
@@ -936,7 +977,7 @@ function renderRecentJobsCard(printers) {
     row.className = "moonRow";
     const left = document.createElement("div");
     left.className = "moonJob";
-    left.textContent = `Printer: ${j.printer}`;
+    left.textContent = `Printer: ${j.printer}${j.jobName ? " · " + j.jobName : ""}`;
     const right = document.createElement("div");
     right.className = "moonNums";
     right.textContent = `${j.totalMeters.toFixed(1)} m · ${fmtG(j.totalGrams)}`;
@@ -946,17 +987,75 @@ function renderRecentJobsCard(printers) {
 
     const sub = document.createElement("div");
     sub.className = "moonSub";
-    const spoolText = j.spools.length
-      ? j.spools
-        .map((s) => {
-          const slot = s.slot || "—";
-          const sid = s.spoolman_id ? `#${s.spoolman_id}` : "";
-          return `${slot}${sid ? " " + sid : ""}`;
-        })
-        .join(", ")
-      : "—";
-    sub.textContent = `Start: ${fmtTs(j.startedAt)} · End: ${fmtTs(j.endedAt)} · Spool: ${spoolText}`;
+    sub.textContent = `Start: ${fmtTs(j.startedAt)} · End: ${fmtTs(j.endedAt)}`;
     entry.appendChild(sub);
+
+    const spoolList = document.createElement("div");
+    spoolList.className = "moonSpoolList";
+    if (!j.spools.length) {
+      const empty = document.createElement("div");
+      empty.className = "moonSpoolEmpty";
+      empty.textContent = "No spool usage recorded";
+      spoolList.appendChild(empty);
+    } else {
+      for (const s of j.spools) {
+        const spoolRow = document.createElement("div");
+        spoolRow.className = "moonSpoolRow";
+
+        const info = document.createElement("div");
+        info.className = "moonSpoolInfo";
+        const swatch = document.createElement("span");
+        swatch.className = "moonSpoolSwatch";
+        const col = normalizeHexColor(s.color_hex);
+        if (col) swatch.style.background = col;
+        info.appendChild(swatch);
+
+        const textWrap = document.createElement("div");
+        textWrap.className = "moonSpoolTextWrap";
+        const label = document.createElement("div");
+        label.className = "moonSpoolLabel";
+        const spoolId = Number(s.spoolman_id || 0);
+        label.textContent = `${recentJobSlotLabel(s.slot)} · ${spoolId > 0 ? "#" + spoolId : "not linked"}`;
+        const meta = document.createElement("div");
+        meta.className = "moonSpoolMeta";
+        meta.textContent = `${(Number(s.meters || 0)).toFixed(2)} m · ${fmtG(Number(s.grams || 0))}`;
+        textWrap.appendChild(label);
+        textWrap.appendChild(meta);
+        info.appendChild(textWrap);
+        spoolRow.appendChild(info);
+
+        const canRelink = spoolmanConfigured && !!j.printer && !!s.slot;
+        const btn = document.createElement("button");
+        btn.className = "btn mini";
+        btn.textContent = spoolId > 0 ? "Relink" : "Link";
+        if (!canRelink) btn.disabled = true;
+        btn.onclick = async (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          try {
+            const picked = await promptSpoolmanSpoolId(j.printer, String(s.slot || ""), spoolId || null);
+            if (!picked) return;
+            btn.disabled = true;
+            btn.textContent = "Saving...";
+            await postJson("/api/ui/jobs/reallocate_spool", {
+              printer_id: j.printer,
+              ended_at: j.endedAt,
+              slot: s.slot,
+              spoolman_id: picked,
+            });
+            await tick();
+          } catch (e) {
+            window.alert(`Failed to reallocate spool: ${e.message || String(e)}`);
+          } finally {
+            btn.disabled = false;
+            btn.textContent = spoolId > 0 ? "Relink" : "Link";
+          }
+        };
+        spoolRow.appendChild(btn);
+        spoolList.appendChild(spoolRow);
+      }
+    }
+    entry.appendChild(spoolList);
 
     list.appendChild(entry);
   }

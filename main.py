@@ -21,6 +21,7 @@ from models.schemas import (
     ApiResponse,
     AppState,
     FeedRequest,
+    JobReallocateSpoolRequest,
     MultiAppState,
     RetractRequest,
     SelectSlotRequest,
@@ -633,6 +634,49 @@ def _spoolman_report_measure(spool_id: int, weight_g: float) -> None:
         print(f"[SPOOLMAN] reported measure: spool {spool_id} = {weight_g:.2f}g")
     except Exception as e:
         print(f"[SPOOLMAN] measure report failed for spool {spool_id}: {e}")
+
+
+def _spoolman_remaining_weight(spool: dict) -> float:
+    try:
+        return max(0.0, float(spool.get("remaining_weight") or 0.0))
+    except Exception:
+        return 0.0
+
+
+def _spoolman_set_remaining_weight(base: str, spool_id: int, weight_g: float) -> None:
+    """PATCH /api/v1/spool/{id} with an exact remaining_weight. Raises on failure."""
+    if not spool_id:
+        raise ValueError("Invalid spool ID")
+    url = f"{base}/api/v1/spool/{spool_id}"
+    data = json.dumps({"remaining_weight": round(max(0.0, weight_g), 2)}).encode("utf-8")
+    req = UrlRequest(url, data=data, headers={
+        "User-Agent": "filament-manager/1.0",
+        "Content-Type": "application/json",
+    }, method="PATCH")
+    with urlopen(req, timeout=5.0) as r:
+        r.read()
+
+
+def _spoolman_id_or_none(value) -> Optional[int]:
+    try:
+        sid = int(value)
+        return sid if sid > 0 else None
+    except Exception:
+        return None
+
+
+def _normalize_color_hex(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if not raw.startswith("#"):
+        raw = "#" + raw
+    if len(raw) != 7:
+        return ""
+    valid = "0123456789abcdef"
+    if any(ch not in valid for ch in raw[1:]):
+        return ""
+    return raw
 
 
 def _spoolman_set_extra(spool_id: int, key: str, value: str) -> None:
@@ -1301,6 +1345,7 @@ def _moon_flush_to_spoolman(
             "material": str(getattr(slot_obj, "material", "") or ""),
             "name": str(getattr(slot_obj, "name", "") or ""),
             "manufacturer": str(getattr(slot_obj, "manufacturer", "") or ""),
+            "color_hex": _normalize_color_hex(str(getattr(slot_obj, "color_hex", "") or "")),
             "grams": round(g, 2),
             "meters": round(meters, 4),
         })
@@ -1777,6 +1822,95 @@ def api_ui_spoolman_unlink(req: SpoolmanUnlinkRequest) -> ApiResponse:
         raise HTTPException(status_code=404, detail="Unknown slot")
 
     state.slots[slot].spoolman_id = None
+    save_state(pid, state)
+    return ApiResponse(result=_ui_state_dict(state))
+
+
+@app.post("/api/ui/jobs/reallocate_spool", response_model=ApiResponse)
+def api_ui_jobs_reallocate_spool(req: JobReallocateSpoolRequest) -> ApiResponse:
+    """Relink a completed job spool usage entry to another Spoolman spool."""
+    base = _spoolman_base_url()
+    if not base:
+        raise HTTPException(status_code=400, detail="Spoolman URL not configured")
+
+    pid = _resolve_printer_id(req.printer_id, allow_unknown=req.printer_id is None)
+    state = load_state(pid)
+    history = state.job_history if isinstance(state.job_history, list) else []
+
+    target_spool = None
+    req_slot = str(req.slot)
+    req_ended_at = float(req.ended_at)
+    for job in reversed(history):
+        if not isinstance(job, dict):
+            continue
+        try:
+            ended_at = float(job.get("ended_at") or 0.0)
+        except Exception:
+            ended_at = 0.0
+        if abs(ended_at - req_ended_at) > 1.0:
+            continue
+        spools = job.get("spools") or []
+        if not isinstance(spools, list):
+            continue
+        for sp in spools:
+            if not isinstance(sp, dict):
+                continue
+            if str(sp.get("slot") or "") == req_slot:
+                target_spool = sp
+                break
+        if target_spool:
+            break
+
+    if target_spool is None:
+        raise HTTPException(status_code=404, detail="Job spool entry not found")
+
+    try:
+        new_spool = _spoolman_get_spool(base, req.spoolman_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Spoolman unreachable: {e}")
+
+    grams = max(0.0, float(target_spool.get("grams") or 0.0))
+    old_spool_id = _spoolman_id_or_none(target_spool.get("spoolman_id"))
+    new_spool_id = int(req.spoolman_id)
+
+    # Move historical usage between Spoolman spools:
+    # - Remove job usage from the new linked spool
+    # - Add that usage back to the old linked spool (if there was one)
+    if grams > 0 and old_spool_id != new_spool_id:
+        old_remaining = None
+        old_target = None
+        if old_spool_id:
+            try:
+                old_spool = _spoolman_get_spool(base, old_spool_id)
+                old_remaining = _spoolman_remaining_weight(old_spool)
+                old_target = old_remaining + grams
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=f"Failed to read previous spool #{old_spool_id}: {e}")
+        new_remaining = _spoolman_remaining_weight(new_spool)
+        new_target = max(0.0, new_remaining - grams)
+        try:
+            _spoolman_set_remaining_weight(base, new_spool_id, new_target)
+            if old_spool_id and old_target is not None:
+                _spoolman_set_remaining_weight(base, old_spool_id, old_target)
+        except Exception as e:
+            # Best-effort rollback so we do not leave usage in a half-moved state.
+            try:
+                _spoolman_set_remaining_weight(base, new_spool_id, new_remaining)
+            except Exception:
+                pass
+            raise HTTPException(status_code=502, detail=f"Failed to move spool usage: {e}")
+
+    filament = new_spool.get("filament") or {}
+    target_spool["spoolman_id"] = new_spool_id
+    if filament.get("material") is not None:
+        target_spool["material"] = str(filament.get("material") or "").upper()
+    if filament.get("name") is not None:
+        target_spool["name"] = str(filament.get("name") or "")
+    if filament.get("vendor") is not None:
+        target_spool["manufacturer"] = str((filament.get("vendor") or {}).get("name") or "")
+    target_spool["color_hex"] = _normalize_color_hex(str(filament.get("color_hex") or ""))
+
+    state.job_history = history[-10:]
     save_state(pid, state)
     return ApiResponse(result=_ui_state_dict(state))
 
