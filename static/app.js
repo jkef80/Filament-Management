@@ -1006,7 +1006,7 @@ function renderRecentJobsCard(printers) {
         info.className = "moonSpoolInfo";
         const swatch = document.createElement("span");
         swatch.className = "moonSpoolSwatch";
-        const col = normalizeHexColor(s.color_hex);
+        const col = normalizeHexColor(s.color_hex || s.color);
         if (col) swatch.style.background = col;
         info.appendChild(swatch);
 

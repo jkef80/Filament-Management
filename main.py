@@ -669,14 +669,26 @@ def _normalize_color_hex(value: str) -> str:
     raw = str(value or "").strip().lower()
     if not raw:
         return ""
-    if not raw.startswith("#"):
-        raw = "#" + raw
-    if len(raw) != 7:
+    if raw.startswith("0x"):
+        raw = raw[2:]
+    if raw.startswith("#"):
+        raw = raw[1:]
+    raw = "".join(ch for ch in raw if ch in "0123456789abcdef")
+    if not raw:
         return ""
-    valid = "0123456789abcdef"
-    if any(ch not in valid for ch in raw[1:]):
+    # Handle common printer formats:
+    # - 0RRGGBB  -> strip leading 0
+    # - AARRGGBB -> strip alpha
+    # - anything longer -> keep least significant RGB bytes
+    if len(raw) == 7 and raw[0] == "0":
+        raw = raw[1:]
+    elif len(raw) == 8:
+        raw = raw[2:]
+    elif len(raw) > 8:
+        raw = raw[-6:]
+    if len(raw) != 6:
         return ""
-    return raw
+    return "#" + raw
 
 
 def _spoolman_set_extra(spool_id: int, key: str, value: str) -> None:
@@ -899,13 +911,8 @@ def _moonraker_base_url(printer_id: str) -> str:
 
 
 def _normalize_ws_color(raw: str) -> str:
-    """Strip leading zero after '#' from Creality color format '#0RRGGBB' → '#RRGGBB'."""
-    s = (raw or "").lstrip("#")
-    if len(s) == 7 and s[0] == "0":
-        return "#" + s[1:].lower()
-    if len(s) == 6:
-        return "#" + s.lower()
-    return raw
+    """Normalize printer color payloads to '#rrggbb'."""
+    return _normalize_color_hex(raw)
 
 
 def _parse_ws_printer_info(payload: dict, printer_id: str) -> None:
@@ -1017,6 +1024,10 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
             "rfid": rfid_raw,
             "selected": selected,
             "present": state_val > 0,
+            "material": mat_type_raw if state_val > 0 else "",
+            "color": _normalize_color_hex(color_norm) if state_val > 0 else "",
+            "name": name_raw if state_val > 0 else "",
+            "manufacturer": vendor_raw if state_val > 0 else "",
         }
         seen_slots.add(slot)
 
@@ -1133,6 +1144,10 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
             "rfid": "",
             "selected": 0,
             "present": False,
+            "material": "",
+            "color": "",
+            "name": "",
+            "manufacturer": "",
         }
 
     # Store box connection metadata so the frontend can show correct boxes.
@@ -1330,12 +1345,27 @@ def _moon_flush_to_spoolman(
     spools: List[dict] = []
     total_grams = 0.0
     total_meters = 0.0
+    spoolman_base = _spoolman_base_url()
+    spool_color_cache: Dict[int, str] = {}
 
     for slot, g in job_g.items():
         if g <= 0:
             continue
         slot_obj = st.slots.get(slot)
         spool_id = getattr(slot_obj, "spoolman_id", None) if slot_obj else None
+        spool_id_norm = _spoolman_id_or_none(spool_id)
+        color_hex = _normalize_color_hex(str(getattr(slot_obj, "color_hex", "") or ""))
+        if spool_id_norm and spoolman_base:
+            if spool_id_norm not in spool_color_cache:
+                spool_color_cache[spool_id_norm] = ""
+                try:
+                    spool_data = _spoolman_get_spool(spoolman_base, spool_id_norm)
+                    filament = spool_data.get("filament") or {}
+                    spool_color_cache[spool_id_norm] = _normalize_color_hex(str(filament.get("color_hex") or ""))
+                except Exception as e:
+                    print(f"[MOON] ({printer_id}) spool color lookup failed for spool {spool_id_norm}: {e}")
+            if spool_color_cache.get(spool_id_norm):
+                color_hex = spool_color_cache[spool_id_norm]
         meters = max(0.0, float(job_mm.get(slot, 0.0) or 0.0) / 1000.0)
         total_grams += g
         total_meters += meters
@@ -1345,7 +1375,7 @@ def _moon_flush_to_spoolman(
             "material": str(getattr(slot_obj, "material", "") or ""),
             "name": str(getattr(slot_obj, "name", "") or ""),
             "manufacturer": str(getattr(slot_obj, "manufacturer", "") or ""),
-            "color_hex": _normalize_color_hex(str(getattr(slot_obj, "color_hex", "") or "")),
+            "color_hex": color_hex,
             "grams": round(g, 2),
             "meters": round(meters, 4),
         })
