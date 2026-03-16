@@ -1214,6 +1214,8 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
     st.cfs_active_slot = active_slot
     if active_slot and active_slot in st.slots:
         st.active_slot = active_slot
+    else:
+        st.active_slot = None
 
     # Direct spool holder (SP) is not a CFS. Only mark connected when at least
     # one CFS box (type 0) is present in the current payload.
@@ -1482,6 +1484,24 @@ async def moonraker_job_poll_loop(printer_id: str) -> None:
 
     _ACTIVE_STATES = {"printing", "paused"}
 
+    def _resolve_tracking_slot(st: AppState) -> Optional[str]:
+        # Prefer the live slot reported by WS when available.
+        if st.cfs_active_slot and st.cfs_active_slot in st.slots:
+            return st.cfs_active_slot
+
+        # Printers without CFS may not report "selected". In that case,
+        # use direct spool input when it is present.
+        cfs_slots = st.cfs_slots if isinstance(st.cfs_slots, dict) else {}
+        sp_meta = cfs_slots.get(PRINTER_SPOOL_SLOT) if isinstance(cfs_slots, dict) else None
+        sp_present = isinstance(sp_meta, dict) and bool(sp_meta.get("present", False))
+        if sp_present and not bool(st.cfs_connected) and PRINTER_SPOOL_SLOT in st.slots:
+            return PRINTER_SPOOL_SLOT
+
+        # Final fallback: legacy active slot.
+        if st.active_slot and st.active_slot in st.slots:
+            return st.active_slot
+        return None
+
     while True:
         await asyncio.sleep(5.0)
         try:
@@ -1512,7 +1532,7 @@ async def moonraker_job_poll_loop(printer_id: str) -> None:
                 _moon_last_filament_mm[printer_id] = filament_used_mm
                 if delta_mm > 0:
                     st = load_state(printer_id)
-                    curr_slot = st.cfs_active_slot or st.active_slot
+                    curr_slot = _resolve_tracking_slot(st)
                     if curr_slot and curr_slot in st.slots:
                         mat_str = str(getattr(st.slots[curr_slot], "material", "OTHER") or "OTHER")
                         g = mm_to_g(mat_str, delta_mm)
@@ -1527,7 +1547,7 @@ async def moonraker_job_poll_loop(printer_id: str) -> None:
                 delta_mm = max(0.0, filament_used_mm - _moon_last_filament_mm.get(printer_id, 0.0))
                 if delta_mm > 0:
                     st = load_state(printer_id)
-                    curr_slot = st.cfs_active_slot or st.active_slot
+                    curr_slot = _resolve_tracking_slot(st)
                     if curr_slot and curr_slot in st.slots:
                         mat_str = str(getattr(st.slots[curr_slot], "material", "OTHER") or "OTHER")
                         g = mm_to_g(mat_str, delta_mm)
