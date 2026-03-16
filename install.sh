@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_DIR="/opt/filament-management"
 SERVICE_NAME="filament-management"
-REPO_URL="https://github.com/jkef80/Filament-Management.git"
+REPO_URL="https://github.com/davidkinnes/CFSync.git"
 
 if [[ ${EUID} -ne 0 ]]; then
   echo "Please run with sudo"
@@ -28,17 +28,19 @@ ask() {
   echo "${var:-$default}"
 }
 
-echo "=== Filament Management Installer ==="
+echo "=== CFSync Installer ==="
 
 UI_PORT=$(ask "UI Port" "8005")
-MOON_HOST=$(ask "Moonraker Host/IP" "192.168.178.148")
-MOON_PORT=$(ask "Moonraker Port" "7125")
-POLL=$(ask "Poll interval (sec)" "5")
+PRINTER_IPS=$(ask "Printer IPs (comma-separated)" "192.168.1.144")
 DIAM=$(ask "Filament diameter (mm)" "1.75")
-AUTOSYNC=$(ask "CFS Autosync? (y/N)" "N")
+SPOOLMAN_URL=$(ask "Spoolman URL (optional, e.g. http://host:7912)" "")
 
-AUTOSYNC_BOOL=false
-if [[ "$AUTOSYNC" =~ ^[Yy]$ ]]; then AUTOSYNC_BOOL=true; fi
+PRINTER_JSON=$(echo "$PRINTER_IPS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | awk '{printf "\"%s\",", $0}' | sed 's/,$//')
+if [ -n "$PRINTER_JSON" ]; then
+  PRINTER_JSON="[$PRINTER_JSON]"
+else
+  PRINTER_JSON="[]"
+fi
 
 echo "Installing to $APP_DIR"
 
@@ -73,10 +75,9 @@ mkdir -p "$APP_DIR/data"
 
 cat > "$APP_DIR/data/config.json" <<CFG
 {
-  "moonraker_url": "http://${MOON_HOST}:${MOON_PORT}",
-  "poll_interval_sec": ${POLL},
+  "printer_urls": ${PRINTER_JSON},
   "filament_diameter_mm": ${DIAM},
-  "cfs_autosync": ${AUTOSYNC_BOOL}
+  "spoolman_url": "${SPOOLMAN_URL}"
 }
 CFG
 
@@ -84,7 +85,7 @@ chown -R "$REAL_USER":"$REAL_USER" "$APP_DIR/data"
 
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<SVC
 [Unit]
-Description=Filament Management
+Description=CFSync
 After=network-online.target
 Wants=network-online.target
 
