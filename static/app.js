@@ -1153,7 +1153,8 @@ function renderRecentJobsCard(printers) {
         const label = document.createElement("div");
         label.className = "moonSpoolLabel";
         const spoolId = Number(s.spoolman_id || 0);
-        label.textContent = `${recentJobSlotLabel(s.slot)} · ${spoolId > 0 ? "#" + spoolId : "not linked"}`;
+        const material = String(s.material || "").trim().toUpperCase();
+        label.textContent = `${recentJobSlotLabel(s.slot)} · ${spoolId > 0 ? "#" + spoolId : "not linked"}${material ? " · " + material : ""}`;
         const meta = document.createElement("div");
         meta.className = "moonSpoolMeta";
         meta.textContent = `${(Number(s.meters || 0)).toFixed(2)} m · ${fmtG(Number(s.grams || 0))}`;
