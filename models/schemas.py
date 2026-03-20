@@ -53,6 +53,12 @@ class SlotStats(BaseModel):
     last_used_at: Optional[float] = None  # Unix timestamp
 
 
+class CfsEnvSample(BaseModel):
+    ts: float
+    temperature_c: Optional[float] = None
+    humidity_pct: Optional[float] = None
+
+
 class AppState(BaseModel):
     active_slot: Optional[str] = None  # legacy; frontend uses cfs_active_slot
     auto_mode: bool = False
@@ -75,6 +81,8 @@ class AppState(BaseModel):
 
     # Lifetime wear stats per slot (cumulative meters, kg, last usage)
     cfs_stats: Dict[str, SlotStats] = Field(default_factory=dict)
+    # Per-box environmental samples (timestamped) for temperature/humidity charts
+    cfs_env_history: Dict[str, List[CfsEnvSample]] = Field(default_factory=dict)
     # Recent print jobs (most recent last), max 10 entries
     job_history: List[Dict[str, Any]] = Field(default_factory=list)
 

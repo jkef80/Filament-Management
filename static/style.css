@@ -109,7 +109,26 @@ body{
   background:linear-gradient(180deg,rgba(17,24,36,.85),rgba(11,15,20,.85));
 }
 .boxHeaderTitle{font-size:14px;font-weight:700;color:var(--text)}
-.boxEnvChip{font-size:11px;color:var(--muted);text-align:center}
+.boxEnvChip{
+  font-size:11px;
+  color:var(--muted);
+  text-align:center;
+  border-radius:999px;
+  border:1px solid transparent;
+  line-height:1;
+}
+.boxEnvChipBtn{
+  cursor:pointer;
+  padding:4px 8px;
+  border-color:rgba(255,255,255,.08);
+  background:rgba(255,255,255,.03);
+  transition:border-color .15s, color .15s, background .15s;
+}
+.boxEnvChipBtn:hover{
+  border-color:rgba(255,255,255,.24);
+  color:var(--text);
+  background:rgba(255,255,255,.06);
+}
 .boxSlots{display:flex;gap:8px;flex:1}
 .boxSlotsSingle{flex:0 0 auto}
 .boxSlotsSingle .slotPod{flex:0 0 128px}
@@ -397,6 +416,36 @@ code{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospa
 .modalStats{margin-top:8px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.08);background:rgba(0,0,0,.18);font-size:13px;line-height:1.45}
 .modalHint{margin-top:10px;font-size:12px;color:var(--muted)}
 @media (max-width:560px){.formRow{grid-template-columns:1fr}}
+
+.envModalPanel{width:min(920px,calc(100% - 32px))}
+.envChartMeta{
+  font-size:12px;
+  color:var(--muted);
+  margin-bottom:10px;
+}
+.envChartBody{
+  border:1px solid rgba(255,255,255,.08);
+  border-radius:12px;
+  background:rgba(0,0,0,.18);
+  min-height:320px;
+  padding:10px;
+}
+.envChartEmpty{
+  min-height:298px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  color:var(--muted);
+  font-size:13px;
+}
+.envChartSvg{display:block;width:100%;height:auto}
+.envGridLine{stroke:rgba(255,255,255,.08);stroke-width:1}
+.envAxisText{fill:rgba(255,255,255,.56);font-size:11px}
+.envLineTemp{stroke:#ff8a3d;fill:none;stroke-width:2.5}
+.envLineHum{stroke:#3fb6ff;fill:none;stroke-width:2.5}
+.envAreaTemp{fill:rgba(255,138,61,.15)}
+.envAreaHum{fill:rgba(63,182,255,.14)}
+.envPoint{fill:#ffffff;stroke-width:2}
 
 /* --- Spoolman section in modal --- */
 .spoolmanSection{margin-bottom:14px;padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.08);background:rgba(0,0,0,.18)}

@@ -55,7 +55,7 @@
     </main>
 
     <!-- cache-bust: force clients to fetch latest app.js after updates -->
-    <script src="/static/app.js?v=20260318-1"></script>
+    <script src="/static/app.js?v=20260320-1"></script>
 
     <!-- Slot / Spool editor (local bookkeeping only; never talks to printer) -->
     <div id="spoolModal" class="modal" style="display:none;">
@@ -115,6 +115,24 @@
             </div>
           </div>
           <div id="historyRelinkHint" class="modalHint">Usage will be moved between linked spools for this job entry.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- CFS environment history modal -->
+    <div id="envChartModal" class="modal" style="display:none;">
+      <div class="modalBackdrop" id="envChartBackdrop"></div>
+      <div class="modalPanel envModalPanel">
+        <div class="modalHead">
+          <div>
+            <div class="modalTitle" id="envChartTitle">CFS Environment</div>
+            <div class="modalSub" id="envChartSub">—</div>
+          </div>
+          <button class="modalClose" id="envChartClose" title="Close">✕</button>
+        </div>
+        <div class="modalBody">
+          <div id="envChartMeta" class="envChartMeta">—</div>
+          <div id="envChartBody" class="envChartBody"></div>
         </div>
       </div>
     </div>

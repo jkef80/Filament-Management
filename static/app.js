@@ -224,6 +224,8 @@ let spoolPrinterId = null;
 let historyRelinkModalOpen = false;
 let historyRelinkPrevPaused = null;
 let historyRelinkCtx = null;
+let envChartModalOpen = false;
+let envChartPrevPaused = null;
 
 function closeSpoolModal() {
   const m = $('spoolModal');
@@ -251,6 +253,19 @@ function closeHistoryRelinkModal() {
   if (historyRelinkPrevPaused !== null) {
     refreshPaused = historyRelinkPrevPaused;
     historyRelinkPrevPaused = null;
+    applyRefreshTimer();
+  }
+}
+
+function closeEnvChartModal() {
+  const m = $('envChartModal');
+  if (m) m.style.display = 'none';
+  const body = $('envChartBody');
+  if (body) body.innerHTML = '';
+  envChartModalOpen = false;
+  if (envChartPrevPaused !== null) {
+    refreshPaused = envChartPrevPaused;
+    envChartPrevPaused = null;
     applyRefreshTimer();
   }
 }
@@ -562,6 +577,199 @@ function initHistoryRelinkModal() {
   }
 }
 
+function envMetricMeta(metricKey) {
+  if (metricKey === 'humidity_pct') {
+    return { title: 'Humidity', unit: '%', lineClass: 'envLineHum', areaClass: 'envAreaHum' };
+  }
+  return { title: 'Temperature', unit: '°C', lineClass: 'envLineTemp', areaClass: 'envAreaTemp' };
+}
+
+function fmtEnvValue(v, metricKey) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '—';
+  if (metricKey === 'humidity_pct') return `${Math.round(n)}%`;
+  return `${n.toFixed(1)}°C`;
+}
+
+function envHistorySeries(history, metricKey) {
+  const out = [];
+  for (const item of (Array.isArray(history) ? history : [])) {
+    if (!item || typeof item !== 'object') continue;
+    const ts = Number(item.ts || 0);
+    const v = Number(item[metricKey]);
+    if (!(ts > 0) || Number.isNaN(v)) continue;
+    out.push({ ts, value: v });
+  }
+  out.sort((a, b) => a.ts - b.ts);
+  const maxPoints = 360;
+  if (out.length <= maxPoints) return out;
+  const step = Math.ceil(out.length / maxPoints);
+  const reduced = [];
+  for (let i = 0; i < out.length; i += step) reduced.push(out[i]);
+  if (reduced[reduced.length - 1] !== out[out.length - 1]) reduced.push(out[out.length - 1]);
+  return reduced;
+}
+
+function renderEnvChart(metricKey, history) {
+  const body = $('envChartBody');
+  const meta = $('envChartMeta');
+  if (!body) return;
+  body.innerHTML = '';
+  const mm = envMetricMeta(metricKey);
+  const points = envHistorySeries(history, metricKey);
+
+  if (!points.length) {
+    if (meta) meta.textContent = 'No samples available yet.';
+    const empty = document.createElement('div');
+    empty.className = 'envChartEmpty';
+    empty.textContent = 'No history yet. Wait for live CFS updates to collect samples.';
+    body.appendChild(empty);
+    return;
+  }
+
+  const first = points[0];
+  const last = points[points.length - 1];
+  if (meta) {
+    meta.textContent = `Samples: ${points.length} · ${fmtTs(first.ts)} → ${fmtTs(last.ts)} · Latest: ${fmtEnvValue(last.value, metricKey)}`;
+  }
+
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('class', 'envChartSvg');
+  svg.setAttribute('viewBox', '0 0 820 320');
+  svg.setAttribute('preserveAspectRatio', 'none');
+
+  const pad = { left: 56, right: 16, top: 16, bottom: 32 };
+  const w = 820;
+  const h = 320;
+  const plotW = w - pad.left - pad.right;
+  const plotH = h - pad.top - pad.bottom;
+  const xMin = first.ts;
+  const xMax = last.ts > xMin ? last.ts : xMin + 1;
+
+  let yMin = Math.min(...points.map(p => p.value));
+  let yMax = Math.max(...points.map(p => p.value));
+  if (Math.abs(yMax - yMin) < 0.001) {
+    const bump = metricKey === 'humidity_pct' ? 2 : 1;
+    yMin -= bump;
+    yMax += bump;
+  } else {
+    const padY = (yMax - yMin) * 0.12;
+    yMin -= padY;
+    yMax += padY;
+  }
+  const yRange = yMax - yMin;
+
+  const toX = (ts) => pad.left + ((ts - xMin) / (xMax - xMin)) * plotW;
+  const toY = (v) => pad.top + (1 - ((v - yMin) / yRange)) * plotH;
+
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.top + (plotH / 4) * i;
+    const val = yMax - (yRange / 4) * i;
+    const line = document.createElementNS(NS, 'line');
+    line.setAttribute('class', 'envGridLine');
+    line.setAttribute('x1', String(pad.left));
+    line.setAttribute('x2', String(w - pad.right));
+    line.setAttribute('y1', String(y));
+    line.setAttribute('y2', String(y));
+    svg.appendChild(line);
+
+    const label = document.createElementNS(NS, 'text');
+    label.setAttribute('class', 'envAxisText');
+    label.setAttribute('x', String(pad.left - 8));
+    label.setAttribute('y', String(y + 4));
+    label.setAttribute('text-anchor', 'end');
+    label.textContent = metricKey === 'humidity_pct' ? `${Math.round(val)}%` : `${val.toFixed(1)}°C`;
+    svg.appendChild(label);
+  }
+
+  const pathPairs = points.map((p) => [toX(p.ts), toY(p.value)]);
+  const pathPoints = pathPairs.map(([x, y]) => `${x},${y}`).join(' ');
+  const areaPoints = pathPairs.map(([x, y]) => `${x} ${y}`).join(' ');
+  const firstX = toX(points[0].ts);
+  const lastX = toX(last.ts);
+  const baselineY = pad.top + plotH;
+
+  const area = document.createElementNS(NS, 'path');
+  area.setAttribute('class', mm.areaClass);
+  area.setAttribute('d', `M ${firstX} ${baselineY} L ${areaPoints} L ${lastX} ${baselineY} Z`);
+  svg.appendChild(area);
+
+  const line = document.createElementNS(NS, 'polyline');
+  line.setAttribute('class', mm.lineClass);
+  line.setAttribute('points', pathPoints);
+  svg.appendChild(line);
+
+  const dot = document.createElementNS(NS, 'circle');
+  dot.setAttribute('class', 'envPoint');
+  dot.setAttribute('cx', String(lastX));
+  dot.setAttribute('cy', String(toY(last.value)));
+  dot.setAttribute('r', '4');
+  dot.setAttribute('stroke', metricKey === 'humidity_pct' ? '#3fb6ff' : '#ff8a3d');
+  svg.appendChild(dot);
+
+  const xStart = document.createElementNS(NS, 'text');
+  xStart.setAttribute('class', 'envAxisText');
+  xStart.setAttribute('x', String(pad.left));
+  xStart.setAttribute('y', String(h - 10));
+  xStart.textContent = new Date(first.ts * 1000).toLocaleString();
+  svg.appendChild(xStart);
+
+  const xEnd = document.createElementNS(NS, 'text');
+  xEnd.setAttribute('class', 'envAxisText');
+  xEnd.setAttribute('x', String(w - pad.right));
+  xEnd.setAttribute('y', String(h - 10));
+  xEnd.setAttribute('text-anchor', 'end');
+  xEnd.textContent = new Date(last.ts * 1000).toLocaleString();
+  svg.appendChild(xEnd);
+
+  body.appendChild(svg);
+}
+
+function openEnvChartModal(ctx) {
+  const m = $('envChartModal');
+  if (!m) return;
+  envChartModalOpen = true;
+
+  if (envChartPrevPaused === null) envChartPrevPaused = refreshPaused;
+  refreshPaused = true;
+  applyRefreshTimer();
+
+  const mm = envMetricMeta(ctx.metricKey);
+  const title = $('envChartTitle');
+  const sub = $('envChartSub');
+  if (title) title.textContent = `CFS Box ${ctx.boxId} · ${mm.title}`;
+  if (sub) {
+    const printer = ctx.printerName || ctx.printerId || 'Printer';
+    sub.textContent = `${printer} · ${ctx.printerId || ''}`.replace(/\s·\s$/, '');
+  }
+
+  renderEnvChart(ctx.metricKey, ctx.history);
+  m.style.display = 'block';
+}
+
+function initEnvChartModal() {
+  const m = $('envChartModal');
+  if (!m) return;
+  const closeBtn = $('envChartClose');
+  const back = $('envChartBackdrop');
+  if (closeBtn) closeBtn.onclick = (ev) => {
+    if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+    closeEnvChartModal();
+  };
+  if (back) back.onclick = (ev) => {
+    if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+    closeEnvChartModal();
+  };
+  document.addEventListener('keydown', (ev) => {
+    if (!envChartModalOpen) return;
+    if (ev.key === 'Escape') {
+      ev.preventDefault();
+      closeEnvChartModal();
+    }
+  });
+}
+
 
 function fmtRelative(ts) {
   if (!ts) return '—';
@@ -864,6 +1072,7 @@ function renderPrinter(printerId, state) {
 
   // Determine which CFS boxes are actually connected.
   const boxesInfo = (slots && slots._boxes) ? slots._boxes : {};
+  const envHistoryByBox = (state.cfs_env_history && typeof state.cfs_env_history === 'object') ? state.cfs_env_history : {};
   const connectedBoxes = [];
   for (const n of ["1", "2", "3", "4"]) {
     const bi = boxesInfo[n];
@@ -975,18 +1184,45 @@ function renderPrinter(printerId, state) {
     header.appendChild(hTitle);
 
     const bi = boxesInfo[boxNum] || {};
+    const boxHistory = Array.isArray(envHistoryByBox[String(boxNum)]) ? envHistoryByBox[String(boxNum)] : [];
     const tC = bi.temperature_c;
     const rh = bi.humidity_pct;
     if (typeof tC === "number" && !Number.isNaN(tC)) {
-      const chip = document.createElement("div");
-      chip.className = "boxEnvChip";
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "boxEnvChip boxEnvChipBtn";
       chip.textContent = `🌡 ${Math.round(tC)}°C`;
+      chip.title = "Show temperature history";
+      chip.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        openEnvChartModal({
+          printerId,
+          printerName: state.printer_name || printerId || "Printer",
+          boxId: String(boxNum),
+          metricKey: "temperature_c",
+          history: boxHistory,
+        });
+      });
       header.appendChild(chip);
     }
     if (typeof rh === "number" && !Number.isNaN(rh)) {
-      const chip = document.createElement("div");
-      chip.className = "boxEnvChip";
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "boxEnvChip boxEnvChipBtn";
       chip.textContent = `💧 ${Math.round(rh)}%`;
+      chip.title = "Show humidity history";
+      chip.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        openEnvChartModal({
+          printerId,
+          printerName: state.printer_name || printerId || "Printer",
+          boxId: String(boxNum),
+          metricKey: "humidity_pct",
+          history: boxHistory,
+        });
+      });
       header.appendChild(chip);
     }
     row.appendChild(header);
@@ -1384,6 +1620,7 @@ function initFluiddUserscript() {
 function boot() {
   initSpoolModal();
   initHistoryRelinkModal();
+  initEnvChartModal();
   initRefreshControls();
   initFluiddBookmarklet();
   initFluiddUserscript();
