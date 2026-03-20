@@ -10,8 +10,33 @@ A local web dashboard for managing filament spools on **Creality K1 series print
 - RFID spool percent from printer sensor; calculated percent for non-RFID spools via Spoolman
 - Spoolman integration — link spools, track remaining weight, auto-report usage at job end
 - Moonraker job tracking — attributes `filament_used` proportionally across active slots at print completion
+- Clickable CFS box temperature/humidity values with historical graphs
+- Recent jobs panel with per-slot filament usage breakdown
+- Reallocate historical job usage to a different Spoolman spool (link/relink)
 - Printer name and firmware version shown in header (read from WebSocket)
 - Dark UI, no build step, runs as a systemd service
+
+## Screenshots
+
+### Dashboard
+
+![CFSync dashboard](docs/screenshot.png)
+
+### Recent jobs
+
+![Recent jobs](docs/screenshot-past-jobs.png)
+
+### Temperature history graph
+
+![Temperature history graph](docs/screenshot-temperature-graph.png)
+
+### Humidity history graph
+
+![Humidity history graph](docs/screenshot-humidity-graph.png)
+
+### Reallocate filament usage
+
+![Reallocate filament usage](docs/screenshot-reallocate-filament-usage.png)
 
 ## Requirements
 
