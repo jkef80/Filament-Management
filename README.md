@@ -1,11 +1,12 @@
 # CFSync
 
-A local web dashboard for managing filament spools on **Creality K1 series printers with CFS** (Colour Filament System), including the K1, K1C, K1 Max, K1 SE, and K2 Plus. CFSync connects directly to the printer over WebSocket, reads live spool data from all CFS slots, and optionally syncs consumption back to [Spoolman](https://github.com/Donkie/Spoolman).
+A local web dashboard for managing filament spools on **Creality K1 series printers with CFS** (Colour Filament System), including the K1, K1C, K1 Max, K1 SE, and K2 Plus. CFSync connects directly to one or more printers over WebSocket, reads live spool data from all CFS slots, and optionally syncs consumption back to [Spoolman](https://github.com/Donkie/Spoolman).
 
 ![CFSync screenshot](docs/screenshot.png)
 
 ## Features
 
+- Multi-printer support — monitor and manage multiple configured printers in one UI
 - Live CFS slot view — filament colour, material, and fill level per slot
 - RFID spool percent from printer sensor; calculated percent for non-RFID spools via Spoolman
 - Spoolman integration — link spools, track remaining weight, auto-report usage at job end
