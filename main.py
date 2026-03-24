@@ -75,9 +75,15 @@ DEFAULT_SLOTS = [
 ]
 PRINTER_SPOOL_SLOT = "SP"
 
-# CFS box environment sampling: keep a rolling 24h history (1 sample/min baseline)
+# CFS box environment sampling and retention policy.
+# Keep recent data at high resolution, but compact older data so state.json
+# remains small even with month-long history.
 _CFS_ENV_MIN_SAMPLE_INTERVAL = 60.0
-_CFS_ENV_MAX_POINTS = 24 * 60
+_CFS_ENV_RETENTION_SECS = 30 * 24 * 3600
+_CFS_ENV_BUCKET_24H_SECS = 60.0
+_CFS_ENV_BUCKET_7D_SECS = 10 * 60.0
+_CFS_ENV_BUCKET_30D_SECS = 60 * 60.0
+_CFS_ENV_MAX_POINTS = 4096
 _CFS_ENV_TEMP_DELTA = 0.2
 _CFS_ENV_HUMIDITY_DELTA = 1.0
 
@@ -126,6 +132,48 @@ def _coerce_cfs_env_sample(sample) -> Optional[dict]:
         out["temperature_c"] = t
     if h is not None:
         out["humidity_pct"] = h
+    return out
+
+
+def _compact_cfs_env_history(samples_in: list, now_ts: float) -> list[dict]:
+    if not samples_in:
+        return []
+
+    cutoff = now_ts - _CFS_ENV_RETENTION_SECS
+    clean: list[dict] = []
+    for item in samples_in:
+        coerced = _coerce_cfs_env_sample(item)
+        if not coerced:
+            continue
+        ts = _as_finite_float_or_none(coerced.get("ts")) or 0.0
+        if ts < cutoff:
+            continue
+        clean.append(coerced)
+    if not clean:
+        return []
+
+    clean.sort(key=lambda x: float(x.get("ts") or 0.0))
+    out: list[dict] = []
+    last_key = None
+    for sample in clean:
+        ts = _as_finite_float_or_none(sample.get("ts")) or 0.0
+        age = max(0.0, now_ts - ts)
+        if age <= 24 * 3600:
+            bucket_span = _CFS_ENV_BUCKET_24H_SECS
+        elif age <= 7 * 24 * 3600:
+            bucket_span = _CFS_ENV_BUCKET_7D_SECS
+        else:
+            bucket_span = _CFS_ENV_BUCKET_30D_SECS
+        key = (int(bucket_span), int(ts // bucket_span))
+        if out and key == last_key:
+            # Keep latest sample in each time bucket.
+            out[-1] = sample
+        else:
+            out.append(sample)
+            last_key = key
+
+    if len(out) > _CFS_ENV_MAX_POINTS:
+        out = out[-_CFS_ENV_MAX_POINTS:]
     return out
 
 
@@ -404,6 +452,7 @@ def _migrate_app_state_dict(data: dict) -> dict:
     data.setdefault("cfs_slots", {})
     data.setdefault("ws_slot_length_m", {})
     data.setdefault("cfs_stats", {})
+    now_ts = _now()
     env_hist_in = data.get("cfs_env_history")
     env_hist_out: Dict[str, list] = {}
     if isinstance(env_hist_in, dict):
@@ -413,14 +462,7 @@ def _migrate_app_state_dict(data: dict) -> dict:
                 continue
             if not isinstance(raw_samples, list):
                 continue
-            samples_out = []
-            for item in raw_samples:
-                coerced = _coerce_cfs_env_sample(item)
-                if not coerced:
-                    continue
-                samples_out.append(coerced)
-            if len(samples_out) > _CFS_ENV_MAX_POINTS:
-                samples_out = samples_out[-_CFS_ENV_MAX_POINTS:]
+            samples_out = _compact_cfs_env_history(raw_samples, now_ts)
             if samples_out:
                 env_hist_out[box_id] = samples_out
     data["cfs_env_history"] = env_hist_out
@@ -1073,9 +1115,7 @@ def _record_cfs_env_sample(
     if hum is not None:
         sample["humidity_pct"] = round(hum, 2)
     hist.append(sample)
-    if len(hist) > _CFS_ENV_MAX_POINTS:
-        hist = hist[-_CFS_ENV_MAX_POINTS:]
-    st.cfs_env_history[box_key] = hist
+    st.cfs_env_history[box_key] = _compact_cfs_env_history(hist, ts)
 
 
 def _parse_ws_printer_info(payload: dict, printer_id: str) -> None:

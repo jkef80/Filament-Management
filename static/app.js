@@ -226,6 +226,8 @@ let historyRelinkPrevPaused = null;
 let historyRelinkCtx = null;
 let envChartModalOpen = false;
 let envChartPrevPaused = null;
+let envChartCtx = null;
+let envChartRange = '24h';
 
 function closeSpoolModal() {
   const m = $('spoolModal');
@@ -262,6 +264,7 @@ function closeEnvChartModal() {
   if (m) m.style.display = 'none';
   const body = $('envChartBody');
   if (body) body.innerHTML = '';
+  envChartCtx = null;
   envChartModalOpen = false;
   if (envChartPrevPaused !== null) {
     refreshPaused = envChartPrevPaused;
@@ -601,22 +604,71 @@ function envHistorySeries(history, metricKey) {
     out.push({ ts, value: v });
   }
   out.sort((a, b) => a.ts - b.ts);
-  const maxPoints = 360;
-  if (out.length <= maxPoints) return out;
-  const step = Math.ceil(out.length / maxPoints);
+  return out;
+}
+
+function downsampleEnvSeries(series, maxPoints = 360) {
+  if (series.length <= maxPoints) return series;
+  const step = Math.ceil(series.length / maxPoints);
   const reduced = [];
-  for (let i = 0; i < out.length; i += step) reduced.push(out[i]);
-  if (reduced[reduced.length - 1] !== out[out.length - 1]) reduced.push(out[out.length - 1]);
+  for (let i = 0; i < series.length; i += step) reduced.push(series[i]);
+  if (reduced[reduced.length - 1] !== series[series.length - 1]) reduced.push(series[series.length - 1]);
   return reduced;
 }
 
-function renderEnvChart(metricKey, history) {
+function envRangeWindowSecs(rangeKey) {
+  if (rangeKey === '7d') return 7 * 24 * 3600;
+  if (rangeKey === '30d') return 30 * 24 * 3600;
+  return 24 * 3600;
+}
+
+function envRangeLabel(rangeKey) {
+  if (rangeKey === '7d') return 'Week';
+  if (rangeKey === '30d') return 'Month';
+  return '24h';
+}
+
+function filterEnvSeriesByRange(series, rangeKey) {
+  if (!series.length) return [];
+  const lastTs = series[series.length - 1].ts;
+  const cutoff = lastTs - envRangeWindowSecs(rangeKey);
+  let anchor = null;
+  const out = [];
+  for (const p of series) {
+    if (p.ts < cutoff) {
+      anchor = p;
+      continue;
+    }
+    out.push(p);
+  }
+  if (anchor && out.length) out.unshift(anchor);
+  if (!out.length && anchor) out.push(anchor);
+  return out;
+}
+
+function updateEnvChartRangeButtons() {
+  const wrap = $('envChartRanges');
+  if (!wrap) return;
+  const buttons = wrap.querySelectorAll('.envRangeBtn[data-range]');
+  for (const btn of buttons) {
+    const range = btn.getAttribute('data-range') || '';
+    btn.classList.toggle('active', range === envChartRange);
+  }
+}
+
+function rerenderEnvChart() {
+  if (!envChartCtx) return;
+  renderEnvChart(envChartCtx.metricKey, envChartCtx.history, envChartRange);
+}
+
+function renderEnvChart(metricKey, history, rangeKey) {
   const body = $('envChartBody');
   const meta = $('envChartMeta');
   if (!body) return;
   body.innerHTML = '';
   const mm = envMetricMeta(metricKey);
-  const points = envHistorySeries(history, metricKey);
+  const allPoints = envHistorySeries(history, metricKey);
+  const points = downsampleEnvSeries(filterEnvSeriesByRange(allPoints, rangeKey));
 
   if (!points.length) {
     if (meta) meta.textContent = 'No samples available yet.';
@@ -630,7 +682,7 @@ function renderEnvChart(metricKey, history) {
   const first = points[0];
   const last = points[points.length - 1];
   if (meta) {
-    meta.textContent = `Samples: ${points.length} · ${fmtTs(first.ts)} → ${fmtTs(last.ts)} · Latest: ${fmtEnvValue(last.value, metricKey)}`;
+    meta.textContent = `${envRangeLabel(rangeKey)} view · Samples: ${points.length} · ${fmtTs(first.ts)} → ${fmtTs(last.ts)} · Latest: ${fmtEnvValue(last.value, metricKey)}`;
   }
 
   const NS = 'http://www.w3.org/2000/svg';
@@ -730,6 +782,8 @@ function openEnvChartModal(ctx) {
   const m = $('envChartModal');
   if (!m) return;
   envChartModalOpen = true;
+  envChartCtx = ctx;
+  envChartRange = '24h';
 
   if (envChartPrevPaused === null) envChartPrevPaused = refreshPaused;
   refreshPaused = true;
@@ -744,7 +798,8 @@ function openEnvChartModal(ctx) {
     sub.textContent = `${printer} · ${ctx.printerId || ''}`.replace(/\s·\s$/, '');
   }
 
-  renderEnvChart(ctx.metricKey, ctx.history);
+  updateEnvChartRangeButtons();
+  rerenderEnvChart();
   m.style.display = 'block';
 }
 
@@ -753,6 +808,7 @@ function initEnvChartModal() {
   if (!m) return;
   const closeBtn = $('envChartClose');
   const back = $('envChartBackdrop');
+  const rangeWrap = $('envChartRanges');
   if (closeBtn) closeBtn.onclick = (ev) => {
     if (ev) { ev.preventDefault(); ev.stopPropagation(); }
     closeEnvChartModal();
@@ -768,6 +824,22 @@ function initEnvChartModal() {
       closeEnvChartModal();
     }
   });
+
+  if (rangeWrap) {
+    const buttons = rangeWrap.querySelectorAll('.envRangeBtn[data-range]');
+    for (const btn of buttons) {
+      btn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const range = btn.getAttribute('data-range') || '24h';
+        if (!['24h', '7d', '30d'].includes(range)) return;
+        envChartRange = range;
+        updateEnvChartRangeButtons();
+        rerenderEnvChart();
+      });
+    }
+    updateEnvChartRangeButtons();
+  }
 }
 
 

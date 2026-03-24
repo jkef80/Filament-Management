@@ -423,6 +423,30 @@ code{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospa
   color:var(--muted);
   margin-bottom:10px;
 }
+.envChartRanges{
+  display:flex;
+  gap:8px;
+  margin-bottom:10px;
+}
+.envRangeBtn{
+  font-size:12px;
+  color:var(--muted);
+  border:1px solid rgba(255,255,255,.10);
+  background:rgba(255,255,255,.04);
+  border-radius:999px;
+  padding:5px 10px;
+  cursor:pointer;
+  transition:border-color .15s, color .15s, background .15s;
+}
+.envRangeBtn:hover{
+  color:var(--text);
+  border-color:rgba(255,255,255,.25);
+}
+.envRangeBtn.active{
+  color:var(--text);
+  border-color:rgba(63,182,255,.6);
+  background:rgba(63,182,255,.16);
+}
 .envChartBody{
   border:1px solid rgba(255,255,255,.08);
   border-radius:12px;
