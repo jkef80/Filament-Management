@@ -1,78 +1,61 @@
 <!doctype html>
-<html lang="de">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Filament Anzeige (K2 Plus / CFS)</title>
+    <title>CFSync</title>
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico" />
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
     <header class="topbar">
       <div class="brand">
-        <div class="logo">🧵</div>
+        <div class="logoWrap">
+          <img src="/static/logo.png" alt="CFSync" class="logoImg" />
+        </div>
         <div>
-          <div class="title">Filament Anzeige</div>
-          <div class="subtitle">&copy; bei jkef 2026</div>
+          <div class="title" id="printerTitle">CFSync</div>
+          <div class="subtitle" id="printerSubtitle">Connecting…</div>
         </div>
       </div>
 
-      <div class="badges">
-        <div id="printerBadge" class="badge">Printer: —</div>
-        <div id="cfsBadge" class="badge">CFS: —</div>
+      <div class="topbarRight">
+        <div class="refreshCtl">
+          <label class="refreshLbl" for="refreshSelect">⟳</label>
+          <select id="refreshSelect" class="refreshSel" title="Refresh interval">
+            <option value="2000">2s</option>
+            <option value="5000">5s</option>
+            <option value="10000">10s</option>
+            <option value="15000">15s</option>
+            <option value="30000">30s</option>
+          </select>
+          <button id="refreshToggle" class="refreshBtn" title="Auto-refresh on/off">⏸</button>
+        </div>
+        <a id="spoolmanExtLink" class="spoolmanLink" href="#" target="_blank" rel="noreferrer" style="display:none;">Spoolman</a>
+        <div class="badges">
+          <div id="printerBadge" class="badge">Printers: —</div>
+          <div id="cfsBadge" class="badge">CFS: —</div>
+        </div>
       </div>
     </header>
 
     <main class="container">
-      <div class="layout">
-        <div class="leftCol">
-          <section class="grid" id="boxesGrid"></section>
-
-          <section class="card" style="margin-top: 16px;">
-            <div class="cardHead">
-              <div class="cardTitle">Aktiv</div>
-              <div id="activeMeta" class="cardMeta">—</div>
-            </div>
-            <div class="activeRow" id="activeRow"></div>
-            <div id="activeLive" class="activeLive" style="display:none;"></div>
-          </section>
-        </div>
-
-        <aside class="rightCol">
-          <section class="card" id="historyCard">
-            <div class="cardHead">
-              <div class="cardTitle">Historie pro Slot</div>
-              <div class="cardMeta">
-                <span class="tag muted">letzte 4</span>
-                <div class="refreshCtl">
-                  <label class="refreshLbl" for="refreshSelect">⟳</label>
-                  <select id="refreshSelect" class="refreshSel" title="Update-Intervall">
-                    <option value="2000">2s</option>
-                    <option value="5000">5s</option>
-                    <option value="10000">10s</option>
-                    <option value="15000">15s</option>
-                    <option value="30000">30s</option>
-                  </select>
-                  <button id="refreshToggle" class="refreshBtn" title="Auto-Update an/aus">⏸</button>
-                </div>
-              </div>
-            </div>
-            <div class="history" id="slotHistory"></div>
-
-            <details class="details" style="margin-top:12px;">
-              <summary>Moonraker-History (gesamt)</summary>
-              <div class="moonHist" id="moonHistory"></div>
-            </details>
-          </section>
-        </aside>
-      </div>
+      <div id="printersWrap" class="printersWrap"></div>
 
       <footer class="footer">
-        <span>Tip: Wenn Farben/Material nicht angezeigt werden, prüfe in <code>data/config.json</code> die <code>moonraker_url</code>.</span>
+        <span class="footerBookmark">
+          <a id="fluiddBookmarklet" class="footerLink" href="#" title="Drag to bookmarks bar, then click in Fluidd to replace the Runout Sensors card with live CFS status">Fluidd panel</a>
+          <button id="fluiddCopyBtn" class="footerCopyBtn" title="Copy bookmarklet to clipboard">⎘</button>
+        </span>
+        <span class="footerSep">·</span>
+        <span class="footerBookmark">
+          <button id="fluiddUserscriptBtn" class="footerCopyBtn" title="Generate a Tampermonkey userscript that auto-loads the panel on every Fluidd page visit">Tampermonkey script</button>
+        </span>
       </footer>
     </main>
 
     <!-- cache-bust: force clients to fetch latest app.js after updates -->
-    <script src="/static/app.js?v=20260225-2"></script>
+    <script src="/static/app.js?v=20260320-1"></script>
 
     <!-- Slot / Spool editor (local bookkeeping only; never talks to printer) -->
     <div id="spoolModal" class="modal" style="display:none;">
@@ -83,21 +66,78 @@
             <div class="modalTitle" id="spoolTitle">Slot</div>
             <div class="modalSub" id="spoolSub">—</div>
           </div>
-          <button class="modalClose" id="spoolClose" title="Schließen">✕</button>
+          <button class="modalClose" id="spoolClose" title="Close">✕</button>
         </div>
         <div class="modalBody">
-          <div class="formRow">
-            <label>Istgewicht (g)</label>
-            <input id="spoolRemain" type="number" min="0" step="1" placeholder="z.B. 206" />
-            <button id="spoolSaveRemain" class="btn">Übernehmen</button>
+          <div id="spoolmanSection" class="spoolmanSection" style="display:none;">
+            <div class="spoolmanHead">
+              <span class="spoolmanTitle">Spoolman</span>
+              <span id="spoolmanBadge" class="tag muted">not linked</span>
+            </div>
+            <div id="spoolmanNotLinked" class="spoolmanNotLinkedWrap">
+              <div id="spoolmanSelect" class="spoolmanList"></div>
+              <button id="spoolmanLink" class="btn">Link</button>
+            </div>
+            <div id="spoolmanLinked" class="spoolmanRow" style="display:none;">
+              <span id="spoolmanInfo" class="spoolmanInfo">—</span>
+              <div class="spoolmanActions">
+                <button id="spoolmanRefresh" class="btn mini">Refresh</button>
+                <button id="spoolmanUnlink" class="btn mini">Unlink</button>
+              </div>
+            </div>
           </div>
-          <div class="formRow">
-            <label>Neue Rolle (g)</label>
-            <input id="spoolStart" type="number" min="1" step="1" placeholder="z.B. 1000" />
-            <button id="spoolSaveStart" class="btn">Rollwechsel</button>
+          <div class="modalStats" id="spoolStats"></div>
+          <div class="modalHint">Note: This saves locally in this app only (no POST to printer).</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent jobs spool relink modal -->
+    <div id="historyRelinkModal" class="modal" style="display:none;">
+      <div class="modalBackdrop" id="historyRelinkBackdrop"></div>
+      <div class="modalPanel">
+        <div class="modalHead">
+          <div>
+            <div class="modalTitle" id="historyRelinkTitle">Relink Job Spool</div>
+            <div class="modalSub" id="historyRelinkSub">—</div>
           </div>
-          <div class="modalStats" id="spoolStats">—</div>
-          <div class="modalHint">Hinweis: Das speichert nur lokal in dieser App (kein POST an den Drucker). Rollwechsel versteckt alte Drucke in der Slot-Historie (bleibt intern gespeichert).</div>
+          <button class="modalClose" id="historyRelinkClose" title="Close">✕</button>
+        </div>
+        <div class="modalBody">
+          <div class="spoolmanSection">
+            <div class="spoolmanHead">
+              <span class="spoolmanTitle">Spoolman</span>
+              <span class="tag muted">Select spool</span>
+            </div>
+            <div class="spoolmanNotLinkedWrap">
+              <div id="historyRelinkSelect" class="spoolmanList"></div>
+              <button id="historyRelinkApply" class="btn">Relink</button>
+            </div>
+          </div>
+          <div id="historyRelinkHint" class="modalHint">Usage will be moved between linked spools for this job entry.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- CFS environment history modal -->
+    <div id="envChartModal" class="modal" style="display:none;">
+      <div class="modalBackdrop" id="envChartBackdrop"></div>
+      <div class="modalPanel envModalPanel">
+        <div class="modalHead">
+          <div>
+            <div class="modalTitle" id="envChartTitle">CFS Environment</div>
+            <div class="modalSub" id="envChartSub">—</div>
+          </div>
+          <button class="modalClose" id="envChartClose" title="Close">✕</button>
+        </div>
+        <div class="modalBody">
+          <div id="envChartMeta" class="envChartMeta">—</div>
+          <div id="envChartRanges" class="envChartRanges">
+            <button class="envRangeBtn" data-range="24h" type="button">24h</button>
+            <button class="envRangeBtn" data-range="7d" type="button">Week</button>
+            <button class="envRangeBtn" data-range="30d" type="button">Month</button>
+          </div>
+          <div id="envChartBody" class="envChartBody"></div>
         </div>
       </div>
     </div>
